@@ -492,59 +492,120 @@ class BeTopDecoder(nn.Module):
         self, center_objects_feature, center_objects_type,
         obj_feature, obj_mask, obj_pos, 
         map_feature, map_mask, map_pos):
-
+        """
+        ============================================================================
+        BeTop Decoder 核心函数 - 详细中文注释版
+        ============================================================================
+        
+        【输入参数说明】
+        - center_objects_feature: [B, D] 中心对象（待预测目标）的特征，来自 Encoder
+        - center_objects_type: [B] 中心对象的类型（车辆/行人/骑行者）
+        - obj_feature: [B, N_agents, D] 场景中所有障碍物的特征
+        - obj_mask: [B, N_agents] 障碍物有效性掩码
+        - obj_pos: [B, N_agents, 3] 障碍物最后时刻位置 (x, y, z)
+        - map_feature: [B, N_map, D] 地图车道线特征
+        - map_mask: [B, N_map] 地图有效性掩码
+        - map_pos: [B, N_map, 3] 地图车道线中心位置
+        
+        【输出】
+        - pred_list: 每层 Decoder 的预测结果列表
+          - pred_scores: [B, 64] 每条轨迹的置信度分数
+          - pred_trajs: [B, 64, 80, 7] 64条候选轨迹，每条80帧，7维状态
+        ============================================================================
+        """
+        
+        # ========== Step 1: 初始化 64 个 Motion Query ==========
+        # intention_query: [64, B, D] - 64个意图点的位置编码，作为 Decoder 的 Query
+        # intention_points: [64, B, 2] - 64个聚类中心点的 xy 坐标
         intention_query, intention_points = self.get_motion_query(center_objects_type)
+        
+        # query_content: [64, B, D] - Query 的内容特征，初始化为零
+        # 这个会在每层 Decoder 中逐步更新，累积上下文信息
         query_content = torch.zeros_like(intention_query)
-        # (num_center_objects, num_query, 2)
+        
+        # 保存 intention_points 用于后续损失计算
+        # 转换为 [B, 64, 2] 的格式
         self.forward_ret_dict['intention_points'] = intention_points.permute(1, 0, 2)  
 
-        dim = query_content.shape[-1]
-        num_center_objects = query_content.shape[1]
-        num_query = query_content.shape[0]
+        dim = query_content.shape[-1]        # D = 512
+        num_center_objects = query_content.shape[1]  # B = batch中待预测对象数量
+        num_query = query_content.shape[0]   # 64 = Motion Query 数量
 
-        # (num_query, num_center_objects, C)
+        # 将中心对象特征复制 64 份，每个 Query 都能访问
+        # [1, B, D] -> [64, B, D]
         center_objects_feature = center_objects_feature[None, :, :].repeat(num_query, 1, 1)  
 
-        base_map_idxs = None
-        map_topo_feat = None
-        actor_topo_feat = None
-        center_gt_positive_idx = None
-        pred_scores, pred_trajs = None, None
-        anchor_trajs, anchor_dist = None, None
+        # ========== Step 2: 初始化各种状态变量 ==========
+        base_map_idxs = None       # 基础地图索引（自车周围的固定区域）
+        map_topo_feat = None       # 地图拓扑特征（跨层传递）
+        actor_topo_feat = None     # 障碍物拓扑特征（跨层传递）
+        center_gt_positive_idx = None  # GT对应的模态索引（训练时使用）
+        pred_scores, pred_trajs = None, None  # 上一层的预测结果
+        anchor_trajs, anchor_dist = None, None  # 用于 Distinct Anchor 选择
 
+        # 预测轨迹的中间路径点，初始化为 intention_points
+        # [B, 64, 1, 2] - 后续会更新为预测轨迹的每一帧
         pred_waypoints = intention_points.permute(1, 0, 2)[:, :, None, :]
+        
+        # 动态 Query 中心，初始化为意图点位置
+        # [64, B, 2] - 后续会更新为预测轨迹的终点
         dynamic_query_center = intention_points
 
+        # ========== Step 3: 生成位置编码 ==========
+        # 地图位置编码: [N_map, B, D]
         map_pos_p = map_pos.permute(1, 0, 2)[:, :, 0:2]
         map_pos_embed = position_encoding_utils.gen_sineembed_for_position(map_pos_p, 
             hidden_dim=map_feature.shape[-1])
 
+        # 障碍物位置编码: [N_agents, B, D]
         obj_pos_p = obj_pos.permute(1, 0, 2)[:, :, 0:2]
         obj_pos_embed = position_encoding_utils.gen_sineembed_for_position(obj_pos_p,
              hidden_dim=obj_feature.shape[-1])
 
-        pred_list = []
+        pred_list = []  # 存储每层的预测结果
 
+        # ============================================================================
+        # ================ Step 4: Decoder 主循环 (共6层) ================
+        # ============================================================================
         for layer_idx in range(self.num_decoder_layers):
             
+            # ---------- Step 4.1: 训练时获取 GT 对应的模态索引 ----------
+            # 用于计算损失时确定哪个模态最接近真值
             if not self.end_to_end:
                 center_gt_positive_idx, anchor_trajs, anchor_dist, _ = self.get_center_gt_idx(
                     layer_idx, pred_scores, pred_trajs, prev_trajs=anchor_trajs, prev_dist=anchor_dist
                 )
 
-            # apply BeTop reasoning / indexing
+            # ============================================================================
+            # ---------- Step 4.2: Agent 拓扑推理 (BeTop 核心创新) ----------
+            # ============================================================================
+            # 【目的】预测每个 Query 和每个障碍物的拓扑关系分数
+            # 【输入】query_content: [64, B, D], obj_feature: [B, N_agents, D]
+            # 【输出】
+            #   - actor_topo_feat: [B, 64, N_agents, D] - 拓扑交互特征（传递到下一层）
+            #   - actor_topo_preds: [B, 1, N_agents, 1] - 当前 GT 模态的拓扑分数（计算损失用）
+            #   - full_actor_topo_preds: [B, 64, N_agents, 1] - 所有模态的拓扑分数（选择 TopK 用）
             actor_topo_feat, actor_topo_preds, full_actor_topo_preds  = self.apply_topo_reasoning(
                 query_feat=query_content, kv_feat=obj_feature,
-                prev_topo_feat=actor_topo_feat,
+                prev_topo_feat=actor_topo_feat,  # 上一层的拓扑特征，实现跨层信息传递
                 fuse_layer=self.actor_topo_fusers[layer_idx], 
                 decoder_layer=self.actor_topo_decoders[layer_idx],
                 query_content_pre_mlp=self.topo_actor_query_content_mlps[layer_idx],
                 center_gt_positive_idx=center_gt_positive_idx,
-                full_preds=True
+                full_preds=True  # 需要完整的 64×N 预测用于索引
             )
-            pred_agent_topo_idx = agent_topo_indexing(
-                full_actor_topo_preds, obj_mask, max_agents=self.num_topo)
             
+            # ---------- Step 4.3: Agent 拓扑索引选择 ----------
+            # 根据拓扑分数，为每个 Query 选择 Top-K 个最相关的障碍物
+            # 【输入】full_actor_topo_preds: [B, 64, N_agents, 1] - 拓扑分数
+            # 【输出】pred_agent_topo_idx: [B, 64, 32] - 选中的障碍物索引（32个）
+            pred_agent_topo_idx = agent_topo_indexing(
+                full_actor_topo_preds, obj_mask, max_agents=self.num_topo)  # num_topo=32
+            
+            # ============================================================================
+            # ---------- Step 4.4: Map 拓扑推理 ----------
+            # ============================================================================
+            # 与 Agent 拓扑推理类似，但针对地图车道线
             map_topo_feat, map_topo_preds, full_map_topo_preds = self.apply_topo_reasoning(
                 query_feat=query_content, kv_feat=map_feature,
                 prev_topo_feat=map_topo_feat,
@@ -552,30 +613,47 @@ class BeTopDecoder(nn.Module):
                 decoder_layer=self.map_topo_decoders[layer_idx],
                 query_content_pre_mlp=self.topo_map_content_mlps[layer_idx],
                 center_gt_positive_idx=center_gt_positive_idx,
-                full_preds=False
+                full_preds=False  # 地图拓扑可以简化，不需要完整预测
             )
+            
+            # ---------- Step 4.5: Map 拓扑索引选择 ----------
+            # 结合两种策略选择地图车道线：
+            # 1. 基础区域：自车周围固定范围的车道线 (256条)
+            # 2. 动态路径：预测轨迹沿途的车道线 (128条)
             pred_map_topo_idxs, base_map_idxs = map_topo_indexing(
                 map_pos=map_pos, map_mask=map_mask,
-                pred_waypoints=pred_waypoints,
-                base_region_offset=self.model_cfg.CENTER_OFFSET_OF_MAP,
-                num_waypoint_polylines=self.model_cfg.NUM_WAYPOINT_MAP_POLYLINES,
-                num_base_polylines=self.model_cfg.NUM_BASE_MAP_POLYLINES,
+                pred_waypoints=pred_waypoints,  # 用预测轨迹来选择沿途车道线
+                base_region_offset=self.model_cfg.CENTER_OFFSET_OF_MAP,  # [30, 0] 前方30米
+                num_waypoint_polylines=self.model_cfg.NUM_WAYPOINT_MAP_POLYLINES,  # 128
+                num_base_polylines=self.model_cfg.NUM_BASE_MAP_POLYLINES,  # 256
                 base_map_idxs=base_map_idxs,
                 num_query=num_query
             )
 
-            #apply Agent/Map TopoAttention decoder:
+            # ============================================================================
+            # ---------- Step 4.6: Topo Cross Attention (Agent) ----------
+            # ============================================================================
+            # 【关键】这里使用 pred_agent_topo_idx 来稀疏化 Attention
+            # Query 只和拓扑分数最高的 32 个障碍物进行交互，而不是全部 N 个
+            # 【输入】
+            #   - query_feat: [64, B, D] 当前 Query 特征
+            #   - kv_feat: [B, N_agents, D] 障碍物特征
+            #   - topo_indexing: [B, 64, 32] 选中的障碍物索引
+            # 【输出】agent_query_feature: [64, B, D] 更新后的 Query 特征
             agent_query_feature = self.apply_cross_attention(
                 query_feat=query_content, kv_feat=obj_feature, kv_mask=obj_mask,
                 query_pos_feat=intention_query, kv_pos_feat=obj_pos_embed, 
-                pred_query_center=dynamic_query_center, topo_indexing=pred_agent_topo_idx,
+                pred_query_center=dynamic_query_center,  # 用当前预测终点作为 Query 的搜索中心
+                topo_indexing=pred_agent_topo_idx,  # 【关键】拓扑索引，实现稀疏 Attention
                 attention_layer=self.obj_decoder_layers[layer_idx],
                 query_feat_pre_mlp=self.actor_query_content_mlps[layer_idx],
                 query_embed_mlp=self.actor_query_embed_mlps,
                 query_feat_pos_mlp=self.actor_query_content_mlps_reverse[layer_idx],
-                is_first=layer_idx==0,    
+                is_first=layer_idx==0,  # 第一层需要特殊处理位置编码
             ) 
 
+            # ---------- Step 4.7: Topo Cross Attention (Map) ----------
+            # 与 Agent 处理类似，但针对地图车道线
             map_query_feature = self.apply_cross_attention(
                 query_feat=query_content, kv_feat=map_feature, kv_mask=map_mask,
                 query_pos_feat=intention_query, kv_pos_feat=map_pos_embed, 
@@ -586,17 +664,33 @@ class BeTopDecoder(nn.Module):
                 is_first=layer_idx==0,   
             ) 
 
-            # Motion prediction
+            # ============================================================================
+            # ---------- Step 4.8: 特征融合 ----------
+            # ============================================================================
+            # 拼接三种特征：中心对象 + Agent交互 + Map交互
+            # [64, B, D] + [64, B, D] + [64, B, D_map] -> [64, B, D*2+D_map]
             query_feature = torch.cat([
                 center_objects_feature, agent_query_feature, map_query_feature
                 ], dim=-1)
          
+            # 通过 MLP 融合并降维回 D
+            # [64*B, D*2+D_map] -> [64*B, D] -> [64, B, D]
             query_content = self.query_feature_fusion_layers[layer_idx](
                 query_feature.flatten(start_dim=0, end_dim=1)
             ).view(num_query, num_center_objects, -1) 
 
+            # ============================================================================
+            # ---------- Step 4.9: 预测头 (Motion Head) ----------
+            # ============================================================================
+            # 将 Query 特征转换为具体的轨迹预测
+            # query_content_t: [B*64, D] - 展平用于批量 MLP
             query_content_t = query_content.permute(1, 0, 2).contiguous().view(num_center_objects * num_query, -1)
+            
+            # 预测置信度分数: [B*64, 1] -> [B, 64]
             pred_scores = self.motion_cls_heads[layer_idx](query_content_t).view(num_center_objects, num_query)
+            
+            # 预测轨迹: [B*64, 80*7] -> [B, 64, 80, 7]
+            # 7维 = (x, y, σx, σy, ρ, vx, vy) - GMM参数 + 速度
             if self.motion_vel_heads is not None:
                 pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 5)
                 pred_vel = self.motion_vel_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 2)
@@ -604,12 +698,22 @@ class BeTopDecoder(nn.Module):
             else:
                 pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 7)
 
+            # 保存当前层的预测结果
             pred_list.append([pred_scores, pred_trajs, actor_topo_preds, map_topo_preds])
-            # update
+            
+            # ============================================================================
+            # ---------- Step 4.10: 更新状态用于下一层 ----------
+            # ============================================================================
+            # 用当前层的预测结果更新 Query 的搜索中心
+            # 这实现了"迭代细化"：下一层的 Attention 会基于更准确的预测位置
+            
+            # pred_waypoints: [B, 64, 80, 2] - 预测轨迹的所有点（用于选择沿途地图）
             pred_waypoints = pred_trajs.detach().clone()[:, :, :, 0:2]
+            
+            # dynamic_query_center: [64, B, 2] - 预测轨迹的终点（用于下一层 Attention）
             dynamic_query_center = pred_trajs.detach().clone()[:, :, -1, 0:2].contiguous().permute(1, 0, 2)  
 
-        assert len(pred_list) == self.num_decoder_layers
+        assert len(pred_list) == self.num_decoder_layers  # 确保 6 层都有输出
         return pred_list
     
     def build_topo_gt(self, gt_trajs, gt_valid_mask, multi_step=1):
@@ -637,7 +741,30 @@ class BeTopDecoder(nn.Module):
         actor_topo, actor_topo_mask, map_topo, map_topo_mask,
         actor_topo_pred, map_topo_pred,
         ):
-
+        """
+        ============================================================================
+        拓扑损失函数 (BeTop 核心创新)
+        ============================================================================
+        
+        【作用】
+        监督模型学习预测正确的拓扑关系（如"自车会从左边超过障碍物A"）
+        
+        【输入】
+        - actor_topo: [B, 1, N_agents, T] Ground Truth 拓扑标签（Braid 编码）
+          - 编码了自车与其他障碍物的交互模式（如轨迹交叉顺序）
+        - actor_topo_mask: [B, 1, N_agents] 有效障碍物掩码
+        - actor_topo_pred: [B, 1, N_agents, 1] 模型预测的拓扑分数
+        - map_topo / map_topo_pred: 地图车道线的拓扑关系（类似）
+        
+        【实现细节】
+        - top_k=True, top_k_ratio=0.25: 只计算 Top 25% 难例的 Loss（Hard Example Mining）
+        - 这样做可以让模型更关注预测错误的样本，提高学习效率
+        
+        【返回】
+        - actor_topo_loss: 障碍物拓扑损失
+        - map_topo_loss: 地图拓扑损失
+        ============================================================================
+        """
         actor_topo_loss = loss_utils.topo_loss(actor_topo_pred, actor_topo.detach(), 
             actor_topo_mask.float().detach(), top_k=True, top_k_ratio=0.25)
         map_topo_loss = loss_utils.topo_loss(map_topo_pred, map_topo[..., None].detach(), 
@@ -646,23 +773,52 @@ class BeTopDecoder(nn.Module):
         return  actor_topo_loss, map_topo_loss
 
     def get_decoder_loss(self, tb_pre_tag=''):
-        center_gt_trajs = self.forward_ret_dict['center_gt_trajs'].cuda()
-        center_gt_trajs_mask = self.forward_ret_dict['center_gt_trajs_mask'].cuda()
-        center_gt_final_valid_idx = self.forward_ret_dict['center_gt_final_valid_idx'].long()
+        """
+        ============================================================================
+        Decoder 主损失函数 - 计算轨迹预测的所有损失
+        ============================================================================
+        
+        【作用】
+        计算 Decoder 每一层的损失，包括：
+        1. loss_reg_gmm: GMM 回归损失（预测轨迹与真值的距离）
+        2. loss_reg_vel: 速度回归损失（预测速度与真值的L1距离）
+        3. loss_cls: 分类损失（预测哪个模态最接近真值）
+        4. loss_topo: 拓扑损失（BeTop 创新，预测交互关系）
+        
+        【损失权重】(来自配置文件)
+        - weight_reg = 1.0
+        - weight_vel = 0.2 (速度权重较小，因为速度比位置容易预测)
+        - weight_cls = 1.0
+        - weight_top = 100 (拓扑权重很大，说明很重要！)
+        
+        【返回】
+        - total_loss: 所有层损失的平均值
+        - tb_dict: TensorBoard 日志字典
+        - disp_dict: 显示字典（用于打印）
+        ============================================================================
+        """
+        # 获取 Ground Truth 数据
+        center_gt_trajs = self.forward_ret_dict['center_gt_trajs'].cuda()  # [B, 80, 4] (x, y, vx, vy)
+        center_gt_trajs_mask = self.forward_ret_dict['center_gt_trajs_mask'].cuda()  # [B, 80] 有效帧掩码
+        center_gt_final_valid_idx = self.forward_ret_dict['center_gt_final_valid_idx'].long()  # [B] 最后有效帧索引
         assert center_gt_trajs.shape[-1] == 4
 
-        pred_list = self.forward_ret_dict['pred_list']
-        intention_points = self.forward_ret_dict['intention_points']  # (num_center_objects, num_query, 2)
+        pred_list = self.forward_ret_dict['pred_list']  # 每层 Decoder 的预测结果
+        intention_points = self.forward_ret_dict['intention_points']  # [B, 64, 2] 意图点
 
         num_center_objects = center_gt_trajs.shape[0]
-        center_gt_goals = center_gt_trajs[torch.arange(num_center_objects), center_gt_final_valid_idx, 0:2]  # (num_center_objects, 2)
+        # 提取真实终点位置，用于确定哪个模态最接近真值
+        center_gt_goals = center_gt_trajs[torch.arange(num_center_objects), center_gt_final_valid_idx, 0:2]  # [B, 2]
         
+        # 构建拓扑 Ground Truth（用于 topo_loss）
         actor_topo, actor_topo_mask, map_topo, map_topo_mask = self.build_topo_gt(
             center_gt_trajs, center_gt_trajs_mask, self.multi_step)
     
         tb_dict = {}
         disp_dict = {}
         total_loss = 0
+        
+        # ========== 遍历每层 Decoder 计算损失 ==========
         for layer_idx in range(self.num_decoder_layers):
      
             pred_scores, pred_trajs, actor_topo_preds, map_topo_preds = pred_list[layer_idx]  
@@ -730,24 +886,58 @@ class BeTopDecoder(nn.Module):
         return total_loss, tb_dict, disp_dict
 
     def get_dense_future_prediction_loss(self, tb_pre_tag='', tb_dict=None, disp_dict=None):
-        obj_trajs_future_state = self.forward_ret_dict['obj_trajs_future_state'].cuda()
-        obj_trajs_future_mask = self.forward_ret_dict['obj_trajs_future_mask'].cuda()
-        pred_dense_trajs = self.forward_ret_dict['pred_dense_trajs'] 
+        """
+        ============================================================================
+        Dense Future Prediction Loss - 场景中所有障碍物的未来轨迹预测损失
+        ============================================================================
+        
+        【作用】
+        这个函数计算的是"场景中所有障碍物"的未来轨迹预测损失，不只是中心对象！
+        
+        【为什么需要这个损失？】
+        1. 预测其他障碍物的未来轨迹可以帮助模型理解"社会交互"
+        2. 这些预测的特征会被融合到中心对象的预测中（见 apply_dense_future_prediction）
+        3. 类似于"我预测你会往左走，所以我应该往右走"
+        
+        【输入（从 forward_ret_dict 获取）】
+        - obj_trajs_future_state: [B, N_agents, 80, 4] 所有障碍物的真实未来轨迹
+        - obj_trajs_future_mask: [B, N_agents, 80] 有效帧掩码
+        - pred_dense_trajs: [B, N_agents, 80, 7] 模型预测的未来轨迹
+          - 7维 = (x, y, σx, σy, ρ, vx, vy) GMM 参数 + 速度
+        
+        【计算内容】
+        - loss_reg_gmm: GMM 位置回归损失（高斯混合模型负对数似然）
+        - loss_reg_vel: 速度回归损失（L1 Loss）
+        
+        【返回】
+        - loss_reg: 平均损失（对所有有效障碍物取平均）
+        ============================================================================
+        """
+        # 获取数据
+        obj_trajs_future_state = self.forward_ret_dict['obj_trajs_future_state'].cuda()  # [B, N, 80, 4]
+        obj_trajs_future_mask = self.forward_ret_dict['obj_trajs_future_mask'].cuda()  # [B, N, 80]
+        pred_dense_trajs = self.forward_ret_dict['pred_dense_trajs']  # [B, N, 80, 7]
         assert pred_dense_trajs.shape[-1] == 7
         assert obj_trajs_future_state.shape[-1] == 4
 
+        # 拆分预测结果：GMM 参数 (x, y, σx, σy, ρ) 和速度 (vx, vy)
         pred_dense_trajs_gmm, pred_dense_trajs_vel = pred_dense_trajs[:, :, :, 0:5], pred_dense_trajs[:, :, :, 5:7]
 
+        # 速度回归损失: L1 Loss
         loss_reg_vel = F.l1_loss(pred_dense_trajs_vel, obj_trajs_future_state[:, :, :, 2:4], reduction='none')
         loss_reg_vel = (loss_reg_vel * obj_trajs_future_mask[:, :, :, None]).sum(dim=-1).sum(dim=-1)
 
+        # 位置回归损失: GMM 负对数似然
         num_center_objects, num_objects, num_timestamps, _ = pred_dense_trajs.shape
-        fake_scores = pred_dense_trajs.new_zeros((num_center_objects, num_objects)).view(-1, 1)  # (num_center_objects * num_objects, 1)
+        # fake_scores: 因为这里不是多模态预测，所以分数全为 0
+        fake_scores = pred_dense_trajs.new_zeros((num_center_objects, num_objects)).view(-1, 1)
 
+        # 展平维度以适配 loss 函数
         temp_pred_trajs = pred_dense_trajs_gmm.contiguous().view(num_center_objects * num_objects, 1, num_timestamps, 5)
-        temp_gt_idx = torch.zeros(num_center_objects * num_objects).cuda().long()  # (num_center_objects * num_objects)
+        temp_gt_idx = torch.zeros(num_center_objects * num_objects).cuda().long()
         temp_gt_trajs = obj_trajs_future_state[:, :, :, 0:2].contiguous().view(num_center_objects * num_objects, num_timestamps, 2)
         temp_gt_trajs_mask = obj_trajs_future_mask.view(num_center_objects * num_objects, num_timestamps)
+        
         loss_reg_gmm, _ = loss_utils.nll_loss_gmm_direct(
             pred_scores=fake_scores, pred_trajs=temp_pred_trajs, gt_trajs=temp_gt_trajs, gt_valid_mask=temp_gt_trajs_mask,
             pre_nearest_mode_idxs=temp_gt_idx,
@@ -755,10 +945,9 @@ class BeTopDecoder(nn.Module):
         )
         loss_reg_gmm = loss_reg_gmm.view(num_center_objects, num_objects)
 
+        # 合并损失并对有效障碍物取平均
         loss_reg = loss_reg_vel + loss_reg_gmm
-
-        obj_valid_mask = obj_trajs_future_mask.sum(dim=-1) > 0
-
+        obj_valid_mask = obj_trajs_future_mask.sum(dim=-1) > 0  # 有任意有效帧的障碍物
         loss_reg = (loss_reg * obj_valid_mask.float()).sum(dim=-1) / torch.clamp_min(obj_valid_mask.sum(dim=-1), min=1.0)
         loss_reg = loss_reg.mean()
 
@@ -771,10 +960,35 @@ class BeTopDecoder(nn.Module):
         return loss_reg, tb_dict, disp_dict
 
     def get_loss(self, tb_pre_tag=''):
-
+        """
+        ============================================================================
+        总损失函数入口 - 训练时调用
+        ============================================================================
+        
+        【作用】
+        汇总所有损失，返回用于反向传播的总损失值
+        
+        【损失组成】
+        total_loss = loss_decoder + loss_dense_prediction
+        
+        其中:
+        - loss_decoder: Decoder 损失 (GMM + Vel + Cls + Topo)
+        - loss_dense_prediction: 场景中所有障碍物的未来轨迹预测损失
+        
+        【返回】
+        - total_loss: 用于 backward() 的总损失
+        - tb_dict: TensorBoard 日志（用于可视化训练曲线）
+        - disp_dict: 显示字典（用于命令行打印）
+        ============================================================================
+        """
+        # Decoder 损失：轨迹预测 + 分类 + 拓扑
         loss_decoder, tb_dict, disp_dict = self.get_decoder_loss(tb_pre_tag=tb_pre_tag)
-        loss_dense_prediction, tb_dict, disp_dict = self.get_dense_future_prediction_loss(tb_pre_tag=tb_pre_tag, tb_dict=tb_dict, disp_dict=disp_dict)
+        
+        # Dense Future 损失：场景中所有障碍物的预测
+        loss_dense_prediction, tb_dict, disp_dict = self.get_dense_future_prediction_loss(
+            tb_pre_tag=tb_pre_tag, tb_dict=tb_dict, disp_dict=disp_dict)
 
+        # 汇总
         total_loss = loss_decoder + loss_dense_prediction
         tb_dict[f'{tb_pre_tag}loss'] = total_loss.item()
         disp_dict[f'{tb_pre_tag}loss'] = total_loss.item()
@@ -782,16 +996,43 @@ class BeTopDecoder(nn.Module):
         return total_loss, tb_dict, disp_dict
 
     def generate_final_prediction(self, pred_list):
-   
+        """
+        ============================================================================
+        推理后处理 - 从 64 条候选轨迹中选出最终的 6 条
+        ============================================================================
+        
+        【作用】
+        推理时调用，通过 NMS（非极大值抑制）筛选出多样化的最终预测轨迹
+        
+        【流程】
+        1. 取最后一层 Decoder 的预测结果（最精细的预测）
+        2. 将分数通过 sigmoid 归一化到 [0, 1]
+        3. 如果候选数 > 输出数（64 > 6），则用 NMS 筛选
+        
+        【NMS 策略】
+        - 按分数排序，贪心选择
+        - 如果新轨迹的终点与已选轨迹终点距离 < 阈值，则跳过
+        - 目的：保证输出轨迹的多样性（不要 6 条轨迹都差不多）
+        
+        【返回】
+        - pred_scores_final: [B, 6] 最终 6 条轨迹的分数
+        - pred_trajs_final: [B, 6, 80, 7] 最终 6 条轨迹
+        - selected_idxs: [B, 6] 被选中的轨迹索引（用于调试）
+        ============================================================================
+        """
+        # 取最后一层的预测结果
         pred_scores, pred_trajs, _, _ = pred_list[-1]
-        pred_scores = torch.sigmoid(pred_scores)
+        pred_scores = torch.sigmoid(pred_scores)  # [B, 64] -> 归一化到 [0, 1]
 
+        # 如果候选数 > 最终输出数，需要 NMS 筛选
         if self.num_motion_modes != num_query:
             assert num_query > self.num_motion_modes
+            # NMS: 64 条 -> 6 条
             pred_trajs_final, pred_scores_final, selected_idxs = motion_utils.inference_distance_nms(
                 pred_scores, pred_trajs
             )
         else:
+            # 无需筛选，直接返回
             pred_trajs_final = pred_trajs
             pred_scores_final = pred_scores
             selected_idxs = None
@@ -799,28 +1040,63 @@ class BeTopDecoder(nn.Module):
         return pred_scores_final, pred_trajs_final, selected_idxs
 
     def forward(self, batch_dict):
+        """
+        ============================================================================
+        BeTopDecoder 前向传播入口
+        ============================================================================
+        
+        【作用】
+        接收 Encoder 的输出，执行完整的 Decoder 流程，输出轨迹预测
+        
+        【输入 batch_dict（来自 Encoder）】
+        - obj_feature: [B, N_agents, D] 障碍物特征
+        - map_feature: [B, N_map, D] 地图特征
+        - center_objects_feature: [B, D] 中心对象特征
+        - obj_pos / map_pos: 位置信息
+        - input_dict: 原始输入数据（包含 GT）
+        
+        【处理流程】
+        1. 特征投影：将 Encoder 特征投影到 Decoder 维度
+        2. Dense Future Prediction：预测场景中所有障碍物的未来轨迹
+        3. Transformer Decoder：6 层 Decoder 迭代预测
+        4. 后处理（推理时）：NMS 选出最终 6 条轨迹
+        
+        【输出（写入 batch_dict）】
+        训练时：pred_list 存入 forward_ret_dict（用于计算 Loss）
+        推理时：pred_scores, pred_trajs 存入 batch_dict（用于评估）
+        ============================================================================
+        """
         input_dict = batch_dict['input_dict']
+        
+        # 从 Encoder 输出中提取特征
         obj_feature, obj_mask, obj_pos = batch_dict['obj_feature'], batch_dict['obj_mask'], batch_dict['obj_pos']
         map_feature, map_mask, map_pos = batch_dict['map_feature'], batch_dict['map_mask'], batch_dict['map_pos']
         center_objects_feature = batch_dict['center_objects_feature']
         num_center_objects, num_objects, _ = obj_feature.shape
         num_polylines = map_feature.shape[1]
 
-        # input projection
-        center_objects_feature = self.in_proj_center_obj(center_objects_feature)
+        # ========== Step 1: 特征投影 ==========
+        # 将 Encoder 输出投影到 Decoder 的维度（可能不同）
+        center_objects_feature = self.in_proj_center_obj(center_objects_feature)  # [B, D] -> [B, D_decoder]
+        
+        # 只对有效障碍物做投影（节省计算）
         obj_feature_valid = self.in_proj_obj(obj_feature[obj_mask])
         obj_feature = obj_feature.new_zeros(num_center_objects, num_objects, obj_feature_valid.shape[-1])
         obj_feature[obj_mask] = obj_feature_valid
 
+        # 只对有效地图做投影
         map_feature_valid = self.in_proj_map(map_feature[map_mask])
         map_feature = map_feature.new_zeros(num_center_objects, num_polylines, map_feature_valid.shape[-1])
         map_feature[map_mask] = map_feature_valid
 
-        # dense future prediction
+        # ========== Step 2: Dense Future Prediction ==========
+        # 预测场景中所有障碍物的未来轨迹，并将预测特征融合回 obj_feature
+        # 这一步让模型能"预判"其他障碍物的行为
         obj_feature, pred_dense_future_trajs = self.apply_dense_future_prediction(
             obj_feature=obj_feature, obj_mask=obj_mask, obj_pos=obj_pos
         )
-        # decoder layers
+        
+        # ========== Step 3: Transformer Decoder ==========
         if self.training:
             self.forward_ret_dict['center_gt_trajs'] = input_dict['center_gt_trajs']
             self.forward_ret_dict['center_gt_trajs_mask'] = input_dict['center_gt_trajs_mask']
