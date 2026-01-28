@@ -9,12 +9,16 @@ import numpy as np
 
 class MLP(nn.Module):
     def __init__(self, in_dim, dims, out_dim, activation=F.relu):
+        # in_dim: 输入维度
+        # dims: 中间维度
+        # out_dim: 输出维度
         super(MLP, self).__init__()
         self.in_layer = nn.Sequential(
             nn.Linear(in_dim, dims[0]),
             nn.ReLU(inplace=True)
         )
         if len(dims) > 0:
+            #  dims 有多个元素，所有的元素值通常必须相等（即 dims=[256, 256, 256]）
             self.layers = nn.ModuleList([
                     nn.Sequential(
                     nn.Linear(dims[i], dims[i]),
@@ -36,6 +40,10 @@ class MLP(nn.Module):
 
 
 class SelfGNN(nn.Module):
+    # in_features: 输入特征维度
+    # out_features: 输出特征维度
+    # edge_weight: 边权重
+    # 处理同一组节点内部的相互关系（类似于 Transformer 中的 Self-Attention）。
     def __init__(self, in_features, out_features, edge_weight=0.5):
         super(SelfGNN, self).__init__()
         self.edge_weight = edge_weight
@@ -51,7 +59,8 @@ class SelfGNN(nn.Module):
         self.edge_weight = edge_weight
 
     def forward(self, x, adj):
-
+        # 它把一个节点自身的信息，和它在图里的“上游邻居”以及“下游邻居”的信息加在一起，更新成这个节点的新特征
+        # support_loop：我看我自己
         support_loop = torch.matmul(x, self.weight)
         output = support_loop
 
@@ -67,6 +76,9 @@ class SelfGNN(nn.Module):
         return output
 
 class CrossGNN(nn.Module):
+    # in_features: 输入特征维度
+    # out_features: 输出特征维度
+    # edge_weight: 边权重
     def __init__(self, in_features, out_features, edge_weight=0.5):
         super(CrossGNN, self).__init__()
         self.edge_weight = edge_weight
@@ -80,6 +92,10 @@ class CrossGNN(nn.Module):
         return output
 
 class CrossOccLayer(nn.Module):
+    # in_features: 输入特征维度
+    # out_features: 输出特征维度
+    # dropout: dropout率
+    # edge_weight: 边权重
     def __init__(self, in_features, out_features, dropout=0.1, edge_weight=0.5):
         super(CrossOccLayer, self).__init__()
 

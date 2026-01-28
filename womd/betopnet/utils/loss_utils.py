@@ -74,40 +74,55 @@ def focal_loss(
         reduction: str = "none",
     ) -> torch.Tensor:
     """
-    Original implementation from
-    https://github.com/facebookresearch/fvcore/blob/master/fvcore/nn/focal_loss.py
-
-    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
-
-    Args:
-        inputs (Tensor): A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets (Tensor): A float tensor with the same shape as inputs. Stores the binary
-                classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-        alpha (float): Weighting factor in range (0,1) to balance
-                positive vs negative examples or -1 for ignore. Default: ``0.25``.
-        gamma (float): Exponent of the modulating factor (1 - p_t) to
-                balance easy vs hard examples. Default: ``2``.
-        reduction (string): ``'none'`` | ``'mean'`` | ``'sum'``
-                ``'none'``: No reduction will be applied to the output.
-                ``'mean'``: The output will be averaged.
-                ``'sum'``: The output will be summed. Default: ``'none'``.
-    Returns:
-        Loss tensor with the reduction option applied.
+    ============================================================================
+    Focal Loss - 用于处理类别不平衡的分类损失
+    ============================================================================
+    
+    【核心思想】
+    普通的交叉熵对所有样本一视同仁，但在目标检测/拓扑预测中，
+    大部分样本是"简单的负样本"（比如没有交互的障碍物），
+    少部分是"困难的正样本"（比如即将发生碰撞的车）。
+    
+    Focal Loss 通过 (1 - p_t)^γ 这个调制因子，让模型：
+    - 对"已经预测得很准"的样本少关注（权重小）
+    - 对"预测得很差"的样本多关注（权重大）
+    
+    【公式】
+    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
+    
+    【参数说明】
+    - inputs: 模型输出的 logits（未经 sigmoid）
+    - targets: Ground Truth 标签 (0 或 1)
+    - alpha: 正负样本的权重平衡因子 (默认 0.25，即正样本权重更小)
+    - gamma: 聚焦因子 (默认 2，值越大越聚焦于难例)
+    ============================================================================
     """
+    # Step 1: 将 logits 转换为概率
     p = torch.sigmoid(inputs)
+    
+    # Step 2: 计算标准的二分类交叉熵损失
+    # 这里用 with_logits 版本，内部会自动做 sigmoid，数值更稳定
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    
+    # Step 3: 计算 p_t（正确类别的预测概率）
+    # 如果 target=1，p_t = p（模型预测为正的概率）
+    # 如果 target=0，p_t = 1-p（模型预测为负的概率）
     p_t = p * targets + (1 - p) * (1 - targets)
+    
+    # Step 4: 应用调制因子 (1 - p_t)^γ
+    # 当预测正确时（p_t 接近 1），(1-p_t)^γ 趋近于 0 → 权重很小
+    # 当预测错误时（p_t 接近 0），(1-p_t)^γ 趋近于 1 → 权重保持
     loss = ce_loss * ((1 - p_t) ** gamma)
 
+    # Step 5: 应用 alpha 权重平衡正负样本
+    # alpha_t = alpha（对正样本）或 (1-alpha)（对负样本）
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
 
-    # Check reduction option and return loss accordingly
+    # Step 6: 根据 reduction 参数决定如何聚合损失
     if reduction == "none":
-        pass
+        pass  # 保持原形状，不聚合
     elif reduction == "mean":
         loss = loss.mean()
     elif reduction == "sum":
@@ -119,29 +134,71 @@ def topo_loss(
     prediction, targets, valid_mask,
     top_k=False, top_k_ratio=1.):
     """
-    build the top-k CE loss for BeTop reasoning
-    preds, targets, valid_mask: [b, src, tgt]
-    return: loss [b]
+    ============================================================================
+    BeTop 拓扑损失函数 (Topology Loss)
+    ============================================================================
+    
+    【核心功能】
+    计算拓扑预测（Braid 编码）与 Ground Truth 的 Focal Loss，
+    并可选地使用 Top-K 策略只关注最难的样本。
+    
+    【输入参数】
+    - prediction: [B, Src, Tgt, Step] 模型预测的拓扑分数
+      - B: Batch Size
+      - Src: 传入时通常是 1（因为在调用前已筛选出正样本模态） -> 64个intention里选出来和gt最像的那个了
+      - Tgt: 目标实体数量（如 N_agents 个障碍物）
+      - Step: 时间步数（如 8 个时间段的拓扑状态）
+    - targets: [B, Src, Tgt, Step] Ground Truth 拓扑标签
+    - valid_mask: [B, Src, Tgt] 有效性掩码（哪些障碍物是真实存在的）
+    - top_k: 是否启用 Top-K 难例挖掘
+    - top_k_ratio: 保留前 K% 的最难样本（默认 1.0 = 100%）
+    
+    【输出】
+    - loss: [B] 每个样本的平均拓扑损失
+    
+    【Top-K 策略的意义】
+    场景中可能有几十个障碍物，但只有少部分和自车有复杂交互。
+    Top-K 策略让模型专注于那些"预测最差"的拓扑关系，
+    忽略那些已经预测得很好的简单情况（如远处静止的车）。
+    ============================================================================
     """
-    b, s, t, step = prediction.shape
+    # 获取各维度大小
+    b, s, t, step = prediction.shape  # [Batch, Src, Tgt, TimeSteps]
     targets = targets.float()
 
+    # Step 1: 计算逐元素的 Focal Loss
+    # 输出形状: [B, S, T, Step]
     loss = focal_loss(
         prediction,
         targets,
-        reduction='none',
+        reduction='none',  # 保持所有维度，不聚合
     )
 
+    # Step 2: 应用有效性掩码
+    # valid_mask: [B, S, T] -> [B, S, T, 1] 扩展后与 loss 相乘
+    # 无效的障碍物（padding）的 loss 置零
     loss = loss * valid_mask[..., None]
+    
+    # Step 3: reshape 以便进行 Top-K 排序
+    # [B, S, T, Step] -> [B, S*T, St ep]
     loss = loss.view(b, s*t, step)
     valid_mask = valid_mask.view(b, s*t)
+    
+    # Step 4: Top-K 难例挖掘（可选）
     if top_k:
-        # Penalises the top-k hardest pixels
-        k = int(top_k_ratio * loss.shape[1])
+        # 只惩罚 loss 最大的前 K 个样本（最难的样本）
+        k = int(top_k_ratio * loss.shape[1])  # 例如 25% 的样本
+        # 按 loss 降序排序，取前 K 个
         loss, _ = torch.sort(loss, dim=1, descending=True)
-        loss = loss[:, :k]
+        loss = loss[:, :k]  # [B, K, Step]
     
-    mask = torch.sum(valid_mask, dim=-1)
-    mask = mask + (mask == 0).float()
+    # Step 5: 计算有效样本数量（用于归一化）
+    mask = torch.sum(valid_mask, dim=-1)  # [B] 每个样本有多少有效实体
+    mask = mask + (mask == 0).float()  # 防止除零
     
+    # Step 6: 计算最终损失
+    # loss.mean(-1): 对时间步取平均 -> [B, S*T] 或 [B, K]
+    # sum(dim=1): 对所有实体求和 -> [B]
+    # / mask: 归一化
+    # 归一化 = 总 loss / 有效障碍物数量  = "障碍物平均贡献的 loss"
     return torch.sum(loss.mean(-1), dim=1) / mask

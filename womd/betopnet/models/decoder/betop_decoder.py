@@ -261,7 +261,8 @@ class BeTopDecoder(nn.Module):
         obj_feature_valid = obj_feature[obj_mask]
         obj_pos_feature_valid = self.obj_pos_encoding_layer(obj_pos_valid)
         obj_fused_feature_valid = torch.cat((obj_pos_feature_valid, obj_feature_valid), dim=-1)
-
+        # obj_fused_feature_valid.shape[-1]:
+        # [Total_Valid_Agents, C]   -> # [Total_Valid_Agents, num_future_frames, 7]
         pred_dense_trajs_valid = self.dense_future_head(obj_fused_feature_valid)
         pred_dense_trajs_valid = pred_dense_trajs_valid.view(pred_dense_trajs_valid.shape[0], 
                 self.num_future_frames, 7)
@@ -270,9 +271,11 @@ class BeTopDecoder(nn.Module):
         pred_dense_trajs_valid = torch.cat((temp_center, pred_dense_trajs_valid[:, :, 2:]), dim=-1)
 
         # future feature encoding and fuse to past obj_feature
+        # 它把未来所有帧（例如80帧）的位置和速度信息展平 (Flatten) -> [Total_Valid_Agents, num_future_frames * 7]，
+        # 然后通过一个 MLP (future_traj_mlps) 提取特征，生成一个 "未来意图向量"。
         obj_future_input_valid = pred_dense_trajs_valid[:, :, [0, 1, -2, -1]].flatten(start_dim=1, end_dim=2) 
         obj_future_feature_valid = self.future_traj_mlps(obj_future_input_valid)
-
+        # 将 "原始对象特征" (来自 Encoder，代表过去) 和 "未来意图向量" (刚刚生成的，代表未来) 拼接在一起。
         obj_full_trajs_feature = torch.cat((obj_feature_valid, obj_future_feature_valid), dim=-1)
         obj_feature_valid = self.traj_fusion_mlps(obj_full_trajs_feature)
 
@@ -288,16 +291,22 @@ class BeTopDecoder(nn.Module):
 
 
     def get_motion_query(self, center_objects_type):
+        # center_objects_type: [B] center object type
+        # intention_points是一个大字典，里面存了N套截然不同的锚点模版：
+        # 适合车的/人的/vru的
         num_center_objects = len(center_objects_type)
 
         intention_points = torch.stack([
             self.intention_points[center_objects_type[obj_idx]]
             for obj_idx in range(num_center_objects)], dim=0)
-        # (num_query, num_center_objects, 2)
+
+        # (num_query, num_center_objects, 2)    
         intention_points = intention_points.permute(1, 0, 2)  
 
         if self.end_to_end:
             # use embeddings
+            # 纯隐式生成：Query = Learnable Embedding + Type Embedding
+            # 这种 Query 是没有任何先验坐标的“抽象概念”。
             agent_type = np.array(
                 [self.type_dict[center_objects_type[obj_idx]] 
                 for obj_idx in range(num_center_objects)])
@@ -306,8 +315,14 @@ class BeTopDecoder(nn.Module):
             embed_type = self.agent_type_embed(agent_type)
             intention_query = self.agent_init_embed.weight
             intention_query = intention_query[:, None, :].repeat(1, num_center_objects, 1) 
+            # 对于第 1 个对象（车）：把 $V_{car}$ 加到它的 64 个意图 Query 上。
+            # 对于第 2 个对象（人）：把 $V_{ped}$ 加到它的 64 个意图 Query 上。
+            # 结果：原本通用的“左转意图”，现在变成了“车的左转意图”和“人的左转意图”。
             intention_query = intention_query + embed_type[None, :, :] 
         else:
+            # 显式生成：Query = Positional Encoding of Anchor Points
+            # 这种 Query 从诞生起就绑定了物理坐标（比如 (10m, 5m)）。
+            # 它代表：“我就站在 (10, 5) 这个位置”。
             intention_query = position_encoding_utils.gen_sineembed_for_position(
                 intention_points, hidden_dim=self.d_model)
 
@@ -421,63 +436,130 @@ class BeTopDecoder(nn.Module):
         prev_dist=None,
         ):
         """
-        Calculating GT modality index
-        Full: calculating by final displacement of anchors
-        E2E: calculating by Winner-Take-All average displacement
+        ============================================================================
+        计算 GT 对应的模态索引 (正样本选择)
+        ============================================================================
+        
+        【核心功能】
+        在 64 个预测模态（Query/Anchor）中，找出那个表现最好的、最应该对 GT 负责的
+        "正样本"，并记录它的索引 center_gt_positive_idx。
+        
+        【两种模式】
+        - E2E 模式: 直接比较预测轨迹和 GT 轨迹的 ADE (平均位移误差)，选最小的
+        - 规则模式: 比较预设意图点和 GT 终点的距离，选最近的 (可能还有去重策略)
+        
+        【输入参数】
+        - layer_idx: 当前 Decoder 层数（用于控制策略切换）
+        - pred_scores: [B, 64] 当前层的预测置信度分数
+        - pred_trajs: [B, 64, 80, 7] 当前层的预测轨迹
+        - pred_list: 历史各层预测结果（用于 Evolving Anchors）
+        - prev_trajs, prev_dist: 上一层的锚点和距离（用于跨层复用）
+        
+        【输出】
+        - center_gt_positive_idx: [B] 每个样本的正样本模态索引 (0~63)
+        - anchor_trajs: 当前使用的锚点轨迹
+        - dist: 距离矩阵
+        - select_mask: 用于 Loss 计算的掩码
+        ============================================================================
         """
         if self.training:
+            # ========== 加载 Ground Truth 数据 ==========
+            # center_gt_trajs: [B, 80, 4] 真实未来轨迹 (x, y, vx, vy)
             center_gt_trajs = self.forward_ret_dict['center_gt_trajs'].cuda()
+            # center_gt_trajs_mask: [B, 80] 每一帧是否有效
             center_gt_trajs_mask = self.forward_ret_dict['center_gt_trajs_mask'].cuda()
+            # center_gt_final_valid_idx: [B] 最后一帧有效的索引 (用于取终点)
             center_gt_final_valid_idx = self.forward_ret_dict['center_gt_final_valid_idx'].long()
+            # intention_points: [B, 64, 2] 预设的 64 个意图点坐标
             intention_points = self.forward_ret_dict['intention_points']
             num_center_objects = center_gt_trajs.shape[0]
 
+            # ============================================================
+            # 【模式 A】E2E 模式：直接比预测轨迹和 GT 的距离
+            # ============================================================
             if self.end_to_end:
+                # 将 mask 扩展维度以便广播: [B, 1, 80]
                 center_gt_trajs_m = center_gt_trajs_mask.float()[:, None]
-                # (num_center_objects, num_query, T)
+                
+                # 计算每条预测轨迹与 GT 轨迹的逐帧距离
+                # pred_trajs: [B, 64, 80, 2], center_gt_trajs: [B, 80, 2]
+                # 结果 dist: [B, 64, 80] -> 每个模态、每一帧的距离
                 dist = (pred_trajs[:, :, :, :2] - center_gt_trajs[:, None, :, :2]).norm(dim=-1)  
+                
+                # 乘以 mask，无效帧距离置零
                 dist = dist * center_gt_trajs_m
+                
+                # 计算 ADE (平均位移误差): 有效帧距离之和 / 有效帧数
+                # 加一个小量防止除零
                 dist = dist.sum(-1) / (center_gt_trajs_m.sum(-1) + (center_gt_trajs_m.sum(-1)==0).float())
-                center_gt_positive_idx = dist.argmin(dim=-1)  # (num_center_objects)
+                
+                # 选出 ADE 最小的那个模态作为正样本
+                # center_gt_positive_idx: [B] 每个样本对应的最佳模态索引
+                center_gt_positive_idx = dist.argmin(dim=-1)
                 return center_gt_positive_idx
 
+            # ============================================================
+            # 【模式 B】规则模式：比意图点和 GT 终点的距离
+            # ============================================================
+            # 取出 GT 轨迹的终点坐标: [B, 2]
             center_gt_goals = center_gt_trajs[torch.arange(num_center_objects), center_gt_final_valid_idx, 0:2] 
-            # (num_center_objects, num_query)
+            
+            # 计算 GT 终点和 64 个意图点的距离: [B, 64]
             dist = (center_gt_goals[:, None, :] - intention_points).norm(dim=-1) 
-            center_gt_positive_idx = dist.argmin(dim=-1)  # (num_center_objects)
+            
+            # 初选：选距离最近的意图点作为正样本
+            center_gt_positive_idx = dist.argmin(dim=-1)  # [B]
 
+            # ============================================================
+            # 【早期层处理】前几层使用静态意图点作为锚点
+            # ============================================================
+            # layer_idx 较小时（前几层），使用静态的 intention_points
             if (layer_idx//self.num_inter_layers) * self.num_inter_layers - 1 < 0:
+                # 将意图点扩展为伪轨迹格式: [B, 64, 1, 2]
                 anchor_trajs = intention_points.unsqueeze(-2)
                 select_mask = None
+                
                 if pred_list is None:
+                    # 如果没有历史预测，直接返回初选结果
                     return center_gt_positive_idx, anchor_trajs, dist, select_mask
+                    
                 if self.distinct_anchors:
+                    # 【去重策略】防止多个样本都选同一个锚点导致模态坍塌
+                    # 综合考虑距离、预测分数、轨迹多样性来重新分配正样本
                     center_gt_positive_idx, select_mask = motion_utils.select_distinct_anchors(
                         dist, pred_scores, pred_trajs, anchor_trajs
                     )
                 return center_gt_positive_idx, anchor_trajs, dist, select_mask
 
+            # ============================================================
+            # 【后期层处理】使用动态进化锚点 (Evolving Anchors)
+            # ============================================================
             if self.distinct_anchors:
-                # Evolving & Distinct Anchors
+                # 进化锚点策略：不再用静态意图点，而是用上一层的预测轨迹作为新锚点
                 if pred_list is None:
-                    # For efficient topo reasoning:
+                    # 高效拓扑推理模式：只在特定层更新锚点
                     unique_layers = set(
                         [(i//self.num_inter_layers)* self.num_inter_layers
                             for i in range(self.num_decoder_layers)]
                     )
                     if layer_idx in unique_layers:
+                        # 当前层需要更新锚点：使用当前预测轨迹
                         anchor_trajs = pred_trajs
+                        # 重新计算距离：用完整轨迹的累积距离
                         dist = ((center_gt_trajs[:, None, :, 0:2] - anchor_trajs[..., 0:2]).norm(dim=-1) * \
                              center_gt_trajs_mask[:, None]).sum(dim=-1) 
                     else:
+                        # 非更新层：复用上一层的锚点和距离
                         anchor_trajs, dist = prev_trajs, prev_dist
                 else:
+                    # 标准模式：从历史预测列表中获取进化锚点
                     anchor_trajs, dist = motion_utils.get_evolving_anchors(
                         layer_idx, self.num_inter_layers, pred_list, 
                         center_gt_goals, intention_points, 
                         center_gt_trajs, center_gt_trajs_mask, 
                         )
 
+                # 使用去重策略重新分配正样本
                 center_gt_positive_idx, select_mask = motion_utils.select_distinct_anchors(
                     dist, pred_scores, pred_trajs, anchor_trajs
                 )
@@ -536,6 +618,7 @@ class BeTopDecoder(nn.Module):
         center_objects_feature = center_objects_feature[None, :, :].repeat(num_query, 1, 1)  
 
         # ========== Step 2: 初始化各种状态变量 ==========
+        # 下面的部分就是把这些初始化的值填值
         base_map_idxs = None       # 基础地图索引（自车周围的固定区域）
         map_topo_feat = None       # 地图拓扑特征（跨层传递）
         actor_topo_feat = None     # 障碍物拓扑特征（跨层传递）
@@ -554,6 +637,10 @@ class BeTopDecoder(nn.Module):
         # ========== Step 3: 生成位置编码 ==========
         # 地图位置编码: [N_map, B, D]
         map_pos_p = map_pos.permute(1, 0, 2)[:, :, 0:2]
+        # 输入地图的xy坐标，输出位置编码
+        # map_pos_p: [N_map, B, 2]
+        # Output map_pos_embed: [N_map, B, 256]
+        # hidden_dim=256 只是告诉它“请炸成 256 块碎片”，而不是说有一个 256 宽的中间层
         map_pos_embed = position_encoding_utils.gen_sineembed_for_position(map_pos_p, 
             hidden_dim=map_feature.shape[-1])
 
@@ -1077,9 +1164,11 @@ class BeTopDecoder(nn.Module):
 
         # ========== Step 1: 特征投影 ==========
         # 将 Encoder 输出投影到 Decoder 的维度（可能不同）
+        # in_proj_center_obj 是一个包含激活函数的2层mlp
         center_objects_feature = self.in_proj_center_obj(center_objects_feature)  # [B, D] -> [B, D_decoder]
         
         # 只对有效障碍物做投影（节省计算）
+        # obj_feature[obj_mask]：[B, N, C] -> [Total_Valid_Agents, C] ：所有 True 的行挑出来，扔掉 False 的行，拼成一个紧凑的大列表。
         obj_feature_valid = self.in_proj_obj(obj_feature[obj_mask])
         obj_feature = obj_feature.new_zeros(num_center_objects, num_objects, obj_feature_valid.shape[-1])
         obj_feature[obj_mask] = obj_feature_valid
