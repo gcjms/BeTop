@@ -21,6 +21,7 @@ from betopnet.models.decoder.topo_decoder import TopoFuser, TopoDecoder
 
 from betopnet.models.utils import common_layers
 from betopnet.utils import common_utils, loss_utils, motion_utils, topo_utils
+from betopnet.utils import longitudinal_topo
 from betopnet.config import cfg
 
 import numpy as np
@@ -40,6 +41,11 @@ class BeTopDecoder(nn.Module):
         self.num_inter_layers = 2
         self.distinct_anchors = self.model_cfg.get('DISTINCT_ANCHORS', True)
         self.multi_step = 1
+        
+        # 纵向拓扑配置 (Longitudinal Topology)
+        self.use_longitudinal_topo = self.model_cfg.get('USE_LONGITUDINAL_TOPO', False)
+        self.longitudinal_s_threshold = self.model_cfg.get('LONGITUDINAL_S_THRESHOLD', 5.0)
+        self.longitudinal_l_threshold = self.model_cfg.get('LONGITUDINAL_L_THRESHOLD', 2.0)
 
         self.num_topo = self.model_cfg.get('NUM_TOPO', 0)
 
@@ -803,7 +809,22 @@ class BeTopDecoder(nn.Module):
         assert len(pred_list) == self.num_decoder_layers  # 确保 6 层都有输出
         return pred_list
     
-    def build_topo_gt(self, gt_trajs, gt_valid_mask, multi_step=1):
+    def build_topo_gt(self, gt_trajs, gt_valid_mask, multi_step=1, reference_path=None):
+        """
+        构建拓扑关系的 Ground Truth
+        
+        Args:
+            gt_trajs: [B, T, 4] ego 的 GT 轨迹
+            gt_valid_mask: [B, T] ego 有效 mask
+            multi_step: 时间分段数
+            reference_path: [B, num_points, 2] 参考路径（用于纵向拓扑）
+            
+        Returns:
+            actor_topo: Agent 拓扑标签
+            actor_topo_mask: Agent 有效 mask
+            map_topo: Map 拓扑标签
+            map_topo_mask: Map 有效 mask
+        """
         gt_trajs = gt_trajs * gt_valid_mask[..., None].float()
         map_pos = self.forward_ret_dict['map_polylines']
         map_mask = self.forward_ret_dict['map_mask']
@@ -813,12 +834,52 @@ class BeTopDecoder(nn.Module):
         tgt_trajs_mask = self.forward_ret_dict['obj_trajs_future_mask'].cuda()
         tgt_trajs = tgt_trajs * tgt_trajs_mask[..., None].float()
 
-        actor_topo = topo_utils.generate_behavior_braids(gt_trajs[:, None, :, :2], tgt_trajs[..., :2], 
-                gt_valid_mask[:, None], tgt_trajs_mask, multi_step)
+        # ========== Actor Topology ==========
+        if self.use_longitudinal_topo:
+            # 使用纵向拓扑检测（专注于超让交互）
+            if reference_path is None:
+                # 如果没有提供参考路径，使用 ego 轨迹本身作为参考
+                actor_topo = longitudinal_topo.generate_longitudinal_braids_simple(
+                    ego_traj=gt_trajs[:, None, :, :2],
+                    agent_trajs=tgt_trajs[..., :2],
+                    ego_mask=gt_valid_mask[:, None],
+                    agent_mask=tgt_trajs_mask,
+                    s_threshold=self.longitudinal_s_threshold,
+                    l_threshold=self.longitudinal_l_threshold,
+                    multi_step=multi_step
+                )
+            else:
+                # 使用上游规划的参考路径
+                actor_topo = longitudinal_topo.generate_longitudinal_braids(
+                    ego_traj=gt_trajs[:, None, :, :2],
+                    agent_trajs=tgt_trajs[..., :2],
+                    ego_mask=gt_valid_mask[:, None],
+                    agent_mask=tgt_trajs_mask,
+                    reference_path=reference_path,
+                    s_threshold=self.longitudinal_s_threshold,
+                    l_threshold=self.longitudinal_l_threshold,
+                    multi_step=multi_step
+                )
+            # 纵向拓扑返回 {-1, 0, +1}，需要转换为二分类（有交互/无交互）用于 loss
+            # 保留原始值用于后续分析，但 loss 只看是否有交互
+            actor_topo_binary = (actor_topo != 0).float()  # 有交互为1，无交互为0
+            # 保存完整的3类拓扑用于分析
+            self.forward_ret_dict['actor_topo_full'] = actor_topo
+            actor_topo = actor_topo_binary
+        else:
+            # 使用原始的 2D 轨迹交叉检测
+            actor_topo = topo_utils.generate_behavior_braids(
+                gt_trajs[:, None, :, :2], tgt_trajs[..., :2], 
+                gt_valid_mask[:, None], tgt_trajs_mask, multi_step
+            )
         actor_topo_mask = torch.any(tgt_trajs_mask, dim=-1)[:, None, :]
 
-        map_topo = topo_utils.generate_map_briads(gt_trajs[:, None, :, :2], map_pos[:, :, :, :2], 
-                gt_valid_mask[:, None, :], polyline_mask, multi_step)
+        # ========== Map Topology ==========
+        # Map 拓扑保持不变（仍然检测轨迹是否穿越车道线）
+        map_topo = topo_utils.generate_map_briads(
+            gt_trajs[:, None, :, :2], map_pos[:, :, :, :2], 
+            gt_valid_mask[:, None, :], polyline_mask, multi_step
+        )
         map_topo_mask = map_mask[:, None, :]
 
         return actor_topo, actor_topo_mask, map_topo, map_topo_mask
