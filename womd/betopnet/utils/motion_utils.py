@@ -165,10 +165,9 @@ def inference_distance_nms(
         )
     )
 
-    pred_trajs_final, pred_scores_final, selected_idxs = motion_utils.batch_nms(
+    pred_trajs_final, pred_scores_final, selected_idxs = batch_nms(
         pred_trajs=pred_trajs, pred_scores=pred_scores,
-        dist_thresh=dist_thresh,
-        num_ret_modes=self.num_motion_modes
+        dist_thresh=dist_thresh, num_ret_modes=num_ret_modes
     )
     return pred_trajs_final, pred_scores_final, selected_idxs
 

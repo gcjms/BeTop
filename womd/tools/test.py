@@ -23,7 +23,7 @@ from betopnet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_t
 from betopnet.datasets import build_dataloader
 from betopnet.models import build_model
 from betopnet.utils import common_utils
-
+from betopnet.utils import motion_utils
 
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
@@ -80,6 +80,53 @@ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id
         joint_pred=joint_pred, final_output_dir=out_path if save_to_file else None
     )
 
+def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=False):
+    evaluated_ckpts = {}
+    while True:
+        ckpt_list = glob.glob(str(ckpt_dir / '*.pth'))
+        ckpt_list.sort(key=os.path.getmtime)
+        if len(ckpt_list) == 0:
+            logger.info('No checkpoint found in %s' % ckpt_dir)
+            if args.max_waiting_mins > 0:
+                time.sleep(30)
+                continue
+            else:
+                break
+
+        for ckpt_file in ckpt_list:
+            ckpt_name = os.path.basename(ckpt_file)
+            if ckpt_name in evaluated_ckpts:
+                continue
+            
+            # Extract epoch id
+            num_list = re.findall(r'\d+', ckpt_name)
+            if len(num_list) == 0:
+                 continue
+            epoch_id = num_list[-1]
+            if int(epoch_id) < args.start_epoch:
+                continue
+
+            try:
+                eval_single_ckpt(
+                    model, test_loader, args, eval_output_dir, 
+                    logger, epoch_id, dist_test=dist_test
+                )
+                evaluated_ckpts[ckpt_name] = True
+            except Exception as e:
+                logger.error(f"Error evaluating {ckpt_file}: {e}")
+                
+        if not getattr(args, 'eval_all', False):
+             # If not eval_all, and we found at least one, maybe we should stop? 
+             # But usually 'repeat_eval_ckpt' implies monitoring.
+             # However, if called from train.py, we typically want to evaluate the *results* of training.
+             # If train.py calls it, it usually means "evaluate what's there".
+             # If we evaluated everything, let's break.
+             break
+        
+        # If we are in a mode where we wait for new checkpoints (not typically triggered by train.py directly unless parallel)
+        # But here train.py finished. So no new ckpts.
+        # We can just break.
+        break
 
 def main():
     args, cfg = parse_config()

@@ -2,8 +2,8 @@ DATA_CONFIG:
     DATASET: BeTopWaymoDataset
     OBJECT_TYPE: &object_type ['TYPE_VEHICLE', 'TYPE_PEDESTRIAN', 'TYPE_CYCLIST']
     
-    DATA_ROOT: 'YOUR_DATA_ROOT'
-    TRAIN_NPZ_DIR: 'YOUR_CACHED_DATA_ROOT'
+    DATA_ROOT: '/home/gcjms/BeTop/data/waymo'
+    TRAIN_NPZ_DIR: '/home/gcjms/BeTop/data/waymo'
     
     SPLIT_DIR: {
         'train': 'processed_scenarios_training', 
@@ -74,7 +74,7 @@ MODEL:
         NUM_FUTURE_FRAMES: 80
         NUM_MOTION_MODES: 6
 
-        INTENTION_POINTS_FILE: data/waymo/cluster_6_center_dict.pkl
+        INTENTION_POINTS_FILE: /home/gcjms/BeTop/data/waymo/cluster_64_center_dict.pkl
 
         D_MODEL: 512
         NUM_DECODER_LAYERS: 6 

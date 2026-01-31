@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from betopnet.models.utils.base_model import BaseModel
 from .encoder import build_encoder
 from .decoder import build_decoder
-
+ 
 
 class BeTopNet(BaseModel):
     def __init__(self, config):

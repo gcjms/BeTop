@@ -1173,11 +1173,13 @@ class BeTopDecoder(nn.Module):
         pred_scores = torch.sigmoid(pred_scores)  # [B, 64] -> 归一化到 [0, 1]
 
         # 如果候选数 > 最终输出数，需要 NMS 筛选
+        num_query = pred_scores.shape[1]
         if self.num_motion_modes != num_query:
             assert num_query > self.num_motion_modes
             # NMS: 64 条 -> 6 条
             pred_trajs_final, pred_scores_final, selected_idxs = motion_utils.inference_distance_nms(
-                pred_scores, pred_trajs
+                pred_scores, pred_trajs, 
+                num_ret_modes=self.num_motion_modes 
             )
         else:
             # 无需筛选，直接返回

@@ -690,7 +690,7 @@ class MTRPPDecoder(nn.Module):
         num_center_objects, num_query, num_future_timestamps, num_feat = pred_trajs.shape
         if self.num_motion_modes != num_query:
             assert num_query > self.num_motion_modes
-            pred_trajs_final, pred_scores_final, selected_idxs = motion_utils.batch_nms(
+            pred_trajs_final, pred_scores_final, selected_idxs =  batch_nms(
                 pred_trajs=pred_trajs, pred_scores=pred_scores,
                 dist_thresh=self.model_cfg.NMS_DIST_THRESH,
                 num_ret_modes=self.num_motion_modes
