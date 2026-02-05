@@ -126,7 +126,7 @@ def generate_behavior_braids(src_trajs, tgt_trajs, src_mask, tgt_mask, multi_ste
     """
     #make full combinations: [b, 1, a, t]
     mask = src_mask[:, :, None, :] * tgt_mask[:, None, :, :]
-    #
+ 
     combinated_trajs = create_batched_combination_trajs(src_trajs, tgt_trajs)
     combinated_trajs = combinated_trajs * mask[:, :, :, None, :, None].float()
 

@@ -836,38 +836,23 @@ class BeTopDecoder(nn.Module):
 
         # ========== Actor Topology ==========
         if self.use_longitudinal_topo:
-            # 使用纵向拓扑检测（专注于超让交互）
-            if reference_path is None:
-                # 如果没有提供参考路径，使用 ego 轨迹本身作为参考
-                actor_topo = longitudinal_topo.generate_longitudinal_braids_simple(
-                    ego_traj=gt_trajs[:, None, :, :2],
-                    agent_trajs=tgt_trajs[..., :2],
-                    ego_mask=gt_valid_mask[:, None],
-                    agent_mask=tgt_trajs_mask,
-                    s_threshold=self.longitudinal_s_threshold,
-                    l_threshold=self.longitudinal_l_threshold,
-                    multi_step=multi_step
-                )
-            else:
-                # 使用上游规划的参考路径
-                actor_topo = longitudinal_topo.generate_longitudinal_braids(
-                    ego_traj=gt_trajs[:, None, :, :2],
-                    agent_trajs=tgt_trajs[..., :2],
-                    ego_mask=gt_valid_mask[:, None],
-                    agent_mask=tgt_trajs_mask,
-                    reference_path=reference_path,
-                    s_threshold=self.longitudinal_s_threshold,
-                    l_threshold=self.longitudinal_l_threshold,
-                    multi_step=multi_step
-                )
-            # 纵向拓扑返回 {-1, 0, +1}，需要转换为二分类（有交互/无交互）用于 loss
-            # 保留原始值用于后续分析，但 loss 只看是否有交互
-            actor_topo_binary = (actor_topo != 0).float()  # 有交互为1，无交互为0
+            # 使用路口冲突检测（基于轨迹交叉，判断谁先到冲突点）
+            actor_topo = longitudinal_topo.generate_intersection_braids(
+                ego_traj=gt_trajs[:, None, :, :2],
+                agent_trajs=tgt_trajs[..., :2],
+                ego_mask=gt_valid_mask[:, None],
+                agent_mask=tgt_trajs_mask,
+                multi_step=multi_step
+            )
+            # 路口拓扑返回 {-1, 0, +1}，需要转换为二分类（有冲突/无冲突）用于 loss
+            # 保留原始值用于后续分析
+            actor_topo_binary = (actor_topo != 0).float()  # 有冲突为1，无冲突为0
             # 保存完整的3类拓扑用于分析
             self.forward_ret_dict['actor_topo_full'] = actor_topo
             actor_topo = actor_topo_binary
         else:
             # 使用原始的 2D 轨迹交叉检测
+            # actor_topo 就是bool值 针对每个map和obs
             actor_topo = topo_utils.generate_behavior_braids(
                 gt_trajs[:, None, :, :2], tgt_trajs[..., :2], 
                 gt_valid_mask[:, None], tgt_trajs_mask, multi_step
@@ -927,11 +912,7 @@ class BeTopDecoder(nn.Module):
         ============================================================================
         
         【作用】
-        计算 Decoder 每一层的损失，包括：
-        1. loss_reg_gmm: GMM 回归损失（预测轨迹与真值的距离）
-        2. loss_reg_vel: 速度回归损失（预测速度与真值的L1距离）
-        3. loss_cls: 分类损失（预测哪个模态最接近真值）
-        4. loss_topo: 拓扑损失（BeTop 创新，预测交互关系）
+  
         
         【损失权重】(来自配置文件)
         - weight_reg = 1.0
@@ -959,6 +940,10 @@ class BeTopDecoder(nn.Module):
         center_gt_goals = center_gt_trajs[torch.arange(num_center_objects), center_gt_final_valid_idx, 0:2]  # [B, 2]
         
         # 构建拓扑 Ground Truth（用于 topo_loss）
+        # actor_topo: [B, 1, N_agents, T] Ground Truth 拓扑标签（Braid 编码）
+        # actor_topo_mask: [B, 1, N_agents] 有效障碍物掩码
+        # map_topo: [B, 1, N_lanes, T] Ground Truth 地图拓扑标签
+        # map_topo_mask: [B, 1, N_lanes] 有效车道线掩码
         actor_topo, actor_topo_mask, map_topo, map_topo_mask = self.build_topo_gt(
             center_gt_trajs, center_gt_trajs_mask, self.multi_step)
     
@@ -972,6 +957,8 @@ class BeTopDecoder(nn.Module):
             pred_scores, pred_trajs, actor_topo_preds, map_topo_preds = pred_list[layer_idx]  
             
             assert pred_trajs.shape[-1] == 7
+            # GMM: [B, 1, N_agents, 5]
+            # vel: [B, 1, N_agents, 2]
             pred_trajs_gmm, pred_vel = pred_trajs[:, :, :, 0:5], pred_trajs[:, :, :, 5:7]
 
             center_gt_positive_idx,_,_,select_mask = self.get_center_gt_idx(

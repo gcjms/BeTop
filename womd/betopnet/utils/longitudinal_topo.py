@@ -1,15 +1,220 @@
 '''
-Longitudinal Topology Detection for BeTop
-专注于纵向超让交互的拓扑检测模块
+Intersection Topology Detection for BeTop
+路口冲突拓扑检测模块
 
-基于上游规划的参考路径，检测 ego 与其他 agent 的纵向交互关系：
-- +1: ego 先通过（超）
-- -1: agent 先通过（让）  
-- 0: 无交互
+检测 ego 与其他 agent 在路口的交互优先级：
+- +1: ego 先到冲突点（抢行）
+- -1: agent 先到冲突点（让行）  
+- 0: 无冲突（轨迹不相交）
 '''
 
 import torch
 import torch.nn.functional as F
+
+# 从 topo_utils 导入线段相交检测函数
+from betopnet.utils.topo_utils import segments_intersect
+
+
+# ============================================================================
+# 路口冲突检测核心函数
+# ============================================================================
+
+def find_trajectory_intersections(
+    ego_traj,       # [B, T, 2] ego 轨迹
+    agent_trajs,    # [B, N, T, 2] agent 轨迹
+    ego_mask,       # [B, T] ego 有效 mask
+    agent_mask,     # [B, N, T] agent 有效 mask
+):
+    """
+    检测 ego 轨迹与每个 agent 轨迹是否有交叉点
+    
+    Returns:
+        has_intersection: [B, N] 是否存在交叉
+        intersection_t_ego: [B, N] ego 到达交叉点的时间索引
+        intersection_t_agent: [B, N] agent 到达交叉点的时间索引
+    """
+    B, T, _ = ego_traj.shape
+    N = agent_trajs.shape[1]
+    device = ego_traj.device
+    
+    # 初始化结果
+    has_intersection = torch.zeros(B, N, device=device, dtype=torch.bool)
+    intersection_t_ego = torch.zeros(B, N, device=device, dtype=torch.float)
+    intersection_t_agent = torch.zeros(B, N, device=device, dtype=torch.float)
+    
+    # 构建 ego 轨迹的线段: [B, T-1, 2] start/end
+    ego_seg_start = ego_traj[:, :-1, :]  # [B, T-1, 2]
+    ego_seg_end = ego_traj[:, 1:, :]     # [B, T-1, 2]
+    ego_seg_mask = ego_mask[:, :-1] & ego_mask[:, 1:]  # [B, T-1]
+    
+    # 对每个 agent 检测交叉
+    for n in range(N):
+        # Agent n 的轨迹线段
+        agent_seg_start = agent_trajs[:, n, :-1, :]  # [B, T-1, 2]
+        agent_seg_end = agent_trajs[:, n, 1:, :]     # [B, T-1, 2]
+        agent_seg_mask = agent_mask[:, n, :-1] & agent_mask[:, n, 1:]  # [B, T-1]
+        
+        # 检测所有 ego 线段 vs 所有 agent 线段的交叉
+        # 扩展维度: ego [B, T-1, 1, 2], agent [B, 1, T-1, 2]
+        ego_start_exp = ego_seg_start[:, :, None, :]  # [B, T-1, 1, 2]
+        ego_end_exp = ego_seg_end[:, :, None, :]
+        agent_start_exp = agent_seg_start[:, None, :, :]  # [B, 1, T-1, 2]
+        agent_end_exp = agent_seg_end[:, None, :, :]
+        
+        # 检测交叉: [B, T-1, T-1]
+        intersect_matrix = segments_intersect(
+            ego_start_exp, ego_end_exp,
+            agent_start_exp, agent_end_exp
+        )
+        
+        # 应用 mask
+        valid_mask = ego_seg_mask[:, :, None] & agent_seg_mask[:, None, :]  # [B, T-1, T-1]
+        intersect_matrix = intersect_matrix & valid_mask
+        
+        # 是否存在任何交叉
+        batch_has_inter = torch.any(intersect_matrix.view(B, -1), dim=-1)  # [B]
+        has_intersection[:, n] = batch_has_inter
+        
+        # 找到第一个交叉点的时间索引
+        for b in range(B):
+            if batch_has_inter[b]:
+                # 找到第一个交叉的 (ego_t, agent_t) 对
+                inter_indices = torch.nonzero(intersect_matrix[b], as_tuple=False)
+                if len(inter_indices) > 0:
+                    # 取时间最早的交叉（ego 时间索引最小的）
+                    first_inter = inter_indices[inter_indices[:, 0].argmin()]
+                    intersection_t_ego[b, n] = first_inter[0].float() + 0.5  # 线段中点
+                    intersection_t_agent[b, n] = first_inter[1].float() + 0.5
+    
+    return has_intersection, intersection_t_ego, intersection_t_agent
+
+
+def detect_intersection_priority(
+    ego_traj,       # [B, 1, T, 2] ego 轨迹
+    agent_trajs,    # [B, N, T, 2] agent 轨迹
+    ego_mask,       # [B, 1, T] ego 有效 mask
+    agent_mask,     # [B, N, T] agent 有效 mask
+    distance_threshold=3.0,  # 交叉点距离阈值（米）
+    multi_step=1,
+):
+    """
+    检测路口冲突的优先级（谁先到冲突点）
+    
+    核心逻辑：
+    1. 检测 ego 轨迹与 agent 轨迹是否在物理空间相交
+    2. 如果相交，比较谁先到达交叉点（T 时间索引更小）
+    3. T_ego < T_agent: ego 先到 -> +1 (抢行)
+       T_ego > T_agent: agent 先到 -> -1 (让行)
+       无交叉: 0
+    
+    Args:
+        ego_traj: [B, 1, T, 2] ego 的轨迹
+        agent_trajs: [B, N, T, 2] 所有 agent 的轨迹
+        ego_mask: [B, 1, T] ego 有效 mask
+        agent_mask: [B, N, T] agent 有效 mask
+        distance_threshold: 判定为"冲突"的距离阈值
+        multi_step: 时间分段数（兼容原接口）
+        
+    Returns:
+        priority: [B, 1, N, multi_step] 优先级
+            - +1: ego 先到（抢行）
+            - -1: agent 先到（让行）
+            - 0: 无冲突
+    """
+    B, _, T, _ = ego_traj.shape
+    N = agent_trajs.shape[1]
+    device = ego_traj.device
+    
+    # Squeeze ego 维度
+    ego_traj_sq = ego_traj.squeeze(1)  # [B, T, 2]
+    ego_mask_sq = ego_mask.squeeze(1)  # [B, T]
+    
+    if multi_step > 1:
+        seg_len = T // multi_step
+        assert seg_len * multi_step == T, f"T={T} 不能被 multi_step={multi_step} 整除"
+        
+        results = []
+        for step in range(multi_step):
+            start_t = step * seg_len
+            end_t = (step + 1) * seg_len
+            
+            # 检测这个时间段内的交叉
+            has_inter, t_ego, t_agent = find_trajectory_intersections(
+                ego_traj_sq[:, start_t:end_t, :],
+                agent_trajs[:, :, start_t:end_t, :],
+                ego_mask_sq[:, start_t:end_t],
+                agent_mask[:, :, start_t:end_t],
+            )
+            
+            # 计算优先级
+            # T_ego < T_agent: ego 先到 -> +1
+            # T_ego > T_agent: agent 先到 -> -1
+            priority = torch.zeros(B, N, device=device)
+            priority = torch.where(
+                has_inter & (t_ego < t_agent),
+                torch.ones_like(priority),   # +1: ego 先到
+                priority
+            )
+            priority = torch.where(
+                has_inter & (t_ego >= t_agent),
+                -torch.ones_like(priority),  # -1: agent 先到
+                priority
+            )
+            results.append(priority)
+        
+        # Stack: [B, N, multi_step] -> [B, 1, N, multi_step]
+        priority_out = torch.stack(results, dim=-1)[:, None, :, :]
+    else:
+        # 单时间段
+        has_inter, t_ego, t_agent = find_trajectory_intersections(
+            ego_traj_sq, agent_trajs, ego_mask_sq, agent_mask
+        )
+        
+        priority = torch.zeros(B, N, device=device)
+        priority = torch.where(
+            has_inter & (t_ego < t_agent),
+            torch.ones_like(priority),
+            priority
+        )
+        priority = torch.where(
+            has_inter & (t_ego >= t_agent),
+            -torch.ones_like(priority),
+            priority
+        )
+        priority_out = priority[:, None, :, None]  # [B, 1, N, 1]
+    
+    return priority_out
+
+
+def generate_intersection_braids(
+    ego_traj,           # [B, 1, T, 2] ego 的轨迹
+    agent_trajs,        # [B, N, T, 2] 其他 agent 轨迹
+    ego_mask,           # [B, 1, T] ego 有效 mask
+    agent_mask,         # [B, N, T] agent 有效 mask
+    multi_step=1,
+):
+    """
+    生成路口冲突的拓扑标签
+    
+    这是主入口函数，替代原来的 generate_longitudinal_braids
+    
+    Args:
+        ego_traj: [B, 1, T, 2] ego 的 GT 轨迹 (x, y)
+        agent_trajs: [B, N, T, 2] 其他 agent 轨迹 (x, y)
+        ego_mask: [B, 1, T] ego 有效 mask
+        agent_mask: [B, N, T] agent 有效 mask
+        multi_step: 时间分段数
+        
+    Returns:
+        braids: [B, 1, N, multi_step] 拓扑标签
+            - +1: ego 先到冲突点（抢行）
+            - -1: agent 先到冲突点（让行）
+            - 0: 无冲突
+    """
+    return detect_intersection_priority(
+        ego_traj, agent_trajs, ego_mask, agent_mask, 
+        multi_step=multi_step
+    )
 
 
 def compute_cumulative_distance(path):
@@ -313,42 +518,91 @@ def generate_longitudinal_braids_simple(
 # 测试函数
 # ============================================================================
 if __name__ == '__main__':
-    print("Testing longitudinal topology detection...")
+    print("=" * 60)
+    print("Testing Intersection Topology Detection")
+    print("=" * 60)
     
-    B, N, T = 4, 10, 80
+    B, N, T = 2, 5, 80
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
     
-    # 创建测试数据
-    # 参考路径：直线 (0,0) -> (100, 0)
-    ref_path = torch.zeros(B, 50, 2, device=device)
-    ref_path[:, :, 0] = torch.linspace(0, 100, 50, device=device)
+    # ========== 测试场景 1: 左转让直行 ==========
+    # Ego: 从 (0,0) 左转到 (30, 30) 
+    # Agent 0: 对向直行，从 (50, 0) 到 (-30, 0)，轨迹会穿过 ego
+    # 预期: Agent 先到冲突点 -> -1 (让行)
     
-    # Ego 轨迹：沿 x 轴从 0 走到 80
+    print("\n[Test 1] 左转让直行")
     ego_traj = torch.zeros(B, 1, T, 2, device=device)
-    ego_traj[:, 0, :, 0] = torch.linspace(0, 80, T, device=device)
+    t_normalized = torch.linspace(0, 1, T, device=device)
+    
+    # Ego 左转: 曲线轨迹
+    ego_traj[:, 0, :, 0] = 30 * t_normalized  # x: 0 -> 30
+    ego_traj[:, 0, :, 1] = 30 * t_normalized  # y: 0 -> 30 (斜向走)
     ego_mask = torch.ones(B, 1, T, device=device).bool()
     
-    # Agent 轨迹：
-    # Agent 0: 在 ego 前面，从 20 走到 60 -> 应该是 "让" (-1)
-    # Agent 1: 在 ego 后面，从 -10 走到 30 -> 应该是 "超" (+1)  
-    # Agent 2: 在另一车道，y=5 -> 应该是 "无交互" (0)
     agent_trajs = torch.zeros(B, N, T, 2, device=device)
-    agent_trajs[:, 0, :, 0] = torch.linspace(20, 60, T, device=device)  # 前面的车
-    agent_trajs[:, 1, :, 0] = torch.linspace(-10, 30, T, device=device)  # 后面的车
-    agent_trajs[:, 2, :, 0] = torch.linspace(10, 50, T, device=device)  # 另一车道
-    agent_trajs[:, 2, :, 1] = 5.0  # y 偏移
-    agent_mask = torch.ones(B, N, T, device=device).bool()
-    agent_mask[:, 3:, :] = False  # 其他 agent 无效
+    agent_mask = torch.zeros(B, N, T, device=device).bool()
     
-    # 测试
-    braids = generate_longitudinal_braids(
-        ego_traj, agent_trajs, ego_mask, agent_mask,
-        ref_path, s_threshold=15.0, l_threshold=2.0
+    # Agent 0: 对向直行，更快速度
+    agent_trajs[:, 0, :, 0] = 50 - 80 * t_normalized  # x: 50 -> -30 (快速)
+    agent_trajs[:, 0, :, 1] = 5  # y: 固定在 5 (会穿过 ego 的轨迹)
+    agent_mask[:, 0, :] = True
+    
+    # Agent 1: 不相交的远处车辆
+    agent_trajs[:, 1, :, 0] = 100 + 10 * t_normalized
+    agent_trajs[:, 1, :, 1] = 50
+    agent_mask[:, 1, :] = True
+    
+    braids = generate_intersection_braids(
+        ego_traj, agent_trajs, ego_mask, agent_mask
     )
     
-    print(f"Output shape: {braids.shape}")  # 应该是 [B, 1, N, 1]
-    print(f"Agent 0 (front car): {braids[0, 0, 0, 0].item()}")  # 应该是 -1 (让)
-    print(f"Agent 1 (rear car): {braids[0, 0, 1, 0].item()}")   # 应该是 +1 (超)
-    print(f"Agent 2 (other lane): {braids[0, 0, 2, 0].item()}") # 应该是 0 (无交互)
+    print(f"Output shape: {braids.shape}")  # [B, 1, N, 1]
+    print(f"Agent 0 (对向直行): {braids[0, 0, 0, 0].item()}")  # 应该是 -1 (让行) 或 +1
+    print(f"Agent 1 (不相交): {braids[0, 0, 1, 0].item()}")    # 应该是 0 (无冲突)
     
-    print("\nTest passed!" if braids[0, 0, 0, 0] == -1 and braids[0, 0, 1, 0] == 1 else "Test may need adjustment")
+    # ========== 测试场景 2: 抢先左转 ==========
+    # Ego 更快，先到冲突点
+    print("\n[Test 2] 抢先左转")
+    ego_traj2 = torch.zeros(B, 1, T, 2, device=device)
+    ego_traj2[:, 0, :, 0] = 50 * t_normalized  # x: 更快
+    ego_traj2[:, 0, :, 1] = 30 * t_normalized  # y
+    
+    agent_trajs2 = torch.zeros(B, N, T, 2, device=device)
+    agent_mask2 = torch.zeros(B, N, T, device=device).bool()
+    
+    # Agent 0: 对向直行，但速度慢
+    agent_trajs2[:, 0, :, 0] = 80 - 40 * t_normalized  # x: 80 -> 40 (慢)
+    agent_trajs2[:, 0, :, 1] = 15  # y
+    agent_mask2[:, 0, :] = True
+    
+    braids2 = generate_intersection_braids(
+        ego_traj2, agent_trajs2, ego_mask, agent_mask2
+    )
+    
+    print(f"Agent 0 (慢速对向): {braids2[0, 0, 0, 0].item()}")  # 可能是 +1 (抢行)
+    
+    # ========== 测试场景 3: 完全平行，无交叉 ==========
+    print("\n[Test 3] 平行轨迹，无交叉")
+    ego_traj3 = torch.zeros(B, 1, T, 2, device=device)
+    ego_traj3[:, 0, :, 0] = 80 * t_normalized  # x
+    ego_traj3[:, 0, :, 1] = 0  # y = 0
+    
+    agent_trajs3 = torch.zeros(B, N, T, 2, device=device)
+    agent_mask3 = torch.zeros(B, N, T, device=device).bool()
+    
+    # Agent 0: 平行行驶
+    agent_trajs3[:, 0, :, 0] = 80 * t_normalized + 10  # x
+    agent_trajs3[:, 0, :, 1] = 5  # y = 5，平行
+    agent_mask3[:, 0, :] = True
+    
+    braids3 = generate_intersection_braids(
+        ego_traj3, agent_trajs3, ego_mask, agent_mask3
+    )
+    
+    print(f"Agent 0 (平行): {braids3[0, 0, 0, 0].item()}")  # 应该是 0 (无冲突)
+    
+    print("\n" + "=" * 60)
+    print("Test completed!")
+    print("=" * 60)
+

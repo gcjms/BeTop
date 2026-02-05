@@ -147,13 +147,17 @@ def select_distinct_anchors(
 def inference_distance_nms(
     pred_scores, pred_trajs,
     lower_dist=2.5, upper_dist=3.5, 
-    lower_length=10, upper_length=50, scalar=1.5
+    lower_length=10, upper_length=50, scalar=1.5,
+    num_ret_modes=6
     ):
     """
     Perform NMS post-processing during inference
     Followed by MTRA
     """
+    # pred_trajs: [B, 64, T, 7]
+    # pred_scores: [B, 1, 64]
     num_center_objects, num_query, num_future_timestamps, num_feat = pred_trajs.shape
+    # pred_scores.argsort(dim=-1)[:, -1] 分数最高的轨迹的索引编号
     top_traj = pred_trajs[torch.arange(num_center_objects), pred_scores.argsort(dim=-1)[:, -1]][..., :2]
     top_traj_length = torch.norm(torch.diff(top_traj, dim=1), dim=-1).sum(dim=-1)
 
@@ -214,7 +218,7 @@ def get_ade_of_each_category(pred_trajs, gt_trajs, gt_trajs_mask, object_types, 
         
     """
     ret_dict = {}
-    
+    # 分样本（vru/vehicle）计算ade
     for cur_type in valid_type_list:
         type_mask = (object_types == cur_type)
         ret_dict[f'{pre_tag}ade_{cur_type}{post_tag}'] = -0.0
