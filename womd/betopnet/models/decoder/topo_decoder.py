@@ -187,13 +187,36 @@ class TopoFuser(nn.Module):
         return agt_inter_feat
 
 class TopoDecoder(nn.Module):
-    def __init__(self, dim, drop=0.1, multi_step=1):
+    """
+    拓扑解码器
+    
+    Args:
+        dim: 输入特征维度
+        drop: dropout 率
+        multi_step: 时间分段数（用于二分类）
+        num_classes: 输出类别数
+            - 1: 二分类（有冲突/无冲突）
+            - 3: 三分类（让/无关/超）
+    """
+    def __init__(self, dim, drop=0.1, multi_step=1, num_classes=1):
         super(TopoDecoder, self).__init__()
-        self.decoder = MLP(dim, [dim], multi_step)
+        self.num_classes = num_classes
+        self.multi_step = multi_step
+        
+        # 输出维度：multi_step * num_classes
+        # 如果是三分类且 multi_step > 1，输出维度通过乘积实现
+        self.out_dim = multi_step * num_classes
+            
+        self.decoder = MLP(dim, [dim], self.out_dim)
     
     def forward(self, occ_feat):
-        # [b, a+m, a+m, 1]
+        # [b, a+m, a+m, out_dim]
         out = self.decoder(occ_feat)
-        # return out[..., 0]
-        return out
         
+        # 如果是三分类，Reshape 为 [B, M, N, multi_step, num_classes]
+        if self.num_classes > 1:
+            B, M, N, _ = out.shape
+            out = out.view(B, M, N, self.multi_step, self.num_classes)
+            
+        return out
+

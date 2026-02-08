@@ -217,6 +217,143 @@ def generate_intersection_braids(
     )
 
 
+def compute_final_intent(
+    ego_traj,           # [B, 1, T, 2] ego 的轨迹
+    agent_trajs,        # [B, N, T, 2] 其他 agent 轨迹
+    ego_mask,           # [B, 1, T] ego 有效 mask
+    agent_mask,         # [B, N, T] agent 有效 mask
+    per_step_topo=None, # [B, 1, N, multi_step] 可选：每段的超让关系
+    strategy='final_position',  # 策略：'final_position', 'majority_vote', 'last_step'
+):
+    """
+    综合全程行为判断最终意图
+    
+    核心思想：
+    - 不看每帧状态的波动
+    - 综合判断这个交互的"最终结果"或"主导意图"
+    
+    Args:
+        ego_traj: [B, 1, T, 2] ego 的 GT 轨迹
+        agent_trajs: [B, N, T, 2] 其他 agent 轨迹
+        ego_mask: [B, 1, T] ego 有效 mask
+        agent_mask: [B, N, T] agent 有效 mask
+        per_step_topo: [B, 1, N, multi_step] 每个时间段的超让关系（可选）
+        strategy: 判断策略
+            - 'final_position': 看最终时刻谁在前面（推荐）
+            - 'majority_vote': 取多数票
+            - 'last_step': 看最后一个时间段的结果
+            
+    Returns:
+        intent: [B, 1, N, 1] 最终意图
+            - +1: ego 意图超车/抢行
+            - -1: ego 意图让行
+            - 0: 无交互意图
+    """
+    B, _, T, _ = ego_traj.shape
+    N = agent_trajs.shape[1]
+    device = ego_traj.device
+    
+    if strategy == 'last_step' and per_step_topo is not None:
+        # 策略1：直接看最后一个时间段的结果
+        intent = per_step_topo[..., -1:]  # [B, 1, N, 1]
+        return intent
+    
+    elif strategy == 'majority_vote' and per_step_topo is not None:
+        # 策略2：多数票
+        # 统计正票（+1）和负票（-1）的数量
+        positive_count = (per_step_topo == 1).sum(dim=-1, keepdim=True).float()
+        negative_count = (per_step_topo == -1).sum(dim=-1, keepdim=True).float()
+        
+        intent = torch.zeros(B, 1, N, 1, device=device)
+        intent = torch.where(positive_count > negative_count, 
+                            torch.ones_like(intent), intent)
+        intent = torch.where(negative_count > positive_count, 
+                            -torch.ones_like(intent), intent)
+        return intent
+    
+    else:  # 'final_position' - 默认策略
+        # 策略3：看最终时刻的相对位置
+        # 这是最直观的判断：最后谁在前面，就是谁"赢了"这次交互
+        
+        ego_traj_sq = ego_traj.squeeze(1)  # [B, T, 2]
+        ego_mask_sq = ego_mask.squeeze(1)  # [B, T]
+        
+        # 获取最后有效时刻的位置
+        # 找到每个 batch 的最后有效帧索引
+        ego_last_valid_idx = ego_mask_sq.sum(dim=-1).long() - 1  # [B]
+        ego_last_valid_idx = ego_last_valid_idx.clamp(min=0)
+        
+        # 获取 ego 最后位置
+        batch_idx = torch.arange(B, device=device)
+        ego_final_pos = ego_traj_sq[batch_idx, ego_last_valid_idx]  # [B, 2]
+        
+        # 获取每个 agent 的最后有效位置
+        agent_last_valid_idx = agent_mask.sum(dim=-1).long() - 1  # [B, N]
+        agent_last_valid_idx = agent_last_valid_idx.clamp(min=0)
+        
+        # 构建索引获取 agent 最后位置
+        batch_idx_exp = batch_idx[:, None].expand(B, N)  # [B, N]
+        agent_idx = torch.arange(N, device=device)[None, :].expand(B, N)  # [B, N]
+        agent_final_pos = agent_trajs[batch_idx_exp, agent_idx, agent_last_valid_idx]  # [B, N, 2]
+        
+        # 首先检测是否有轨迹交叉（复用 find_trajectory_intersections）
+        has_inter, t_ego, t_agent = find_trajectory_intersections(
+            ego_traj_sq, agent_trajs, ego_mask_sq, agent_mask
+        )  # [B, N]
+        
+        # 对于有交叉的情况，看最终相对位置
+        # 计算 ego 和 agent 最后位置沿 ego 行进方向的投影比较
+        # 简化：直接比较到原点的距离（假设都在远离原点）
+        ego_dist = ego_final_pos.norm(dim=-1)  # [B]
+        agent_dist = agent_final_pos.norm(dim=-1)  # [B, N]
+        
+        # 如果 ego 走得更远 → ego 在前 → +1（超）
+        # 如果 agent 走得更远 → agent 在前 → -1（让）
+        intent = torch.zeros(B, N, device=device)
+        intent = torch.where(
+            has_inter & (ego_dist[:, None] > agent_dist),
+            torch.ones_like(intent),  # +1: ego 在前（超）
+            intent
+        )
+        intent = torch.where(
+            has_inter & (ego_dist[:, None] <= agent_dist),
+            -torch.ones_like(intent),  # -1: agent 在前（让）
+            intent
+        )
+        
+        return intent[:, None, :, None]  # [B, 1, N, 1]
+
+
+def generate_intersection_braids_with_intent(
+    ego_traj,           # [B, 1, T, 2] ego 的轨迹
+    agent_trajs,        # [B, N, T, 2] 其他 agent 轨迹
+    ego_mask,           # [B, 1, T] ego 有效 mask
+    agent_mask,         # [B, N, T] agent 有效 mask
+    multi_step=1,
+    intent_strategy='final_position',
+):
+    """
+    生成路口冲突的拓扑标签，同时返回最终意图
+    
+    Returns:
+        braids: [B, 1, N, multi_step] 每段的拓扑标签
+        intent: [B, 1, N, 1] 最终意图（用于训练3分类）
+    """
+    # 获取每段的超让关系
+    braids = generate_intersection_braids(
+        ego_traj, agent_trajs, ego_mask, agent_mask, multi_step
+    )
+    
+    # 计算最终意图
+    intent = compute_final_intent(
+        ego_traj, agent_trajs, ego_mask, agent_mask,
+        per_step_topo=braids,
+        strategy=intent_strategy,
+    )
+    
+    return braids, intent
+
+
 def compute_cumulative_distance(path):
     """
     计算路径的累积弧长

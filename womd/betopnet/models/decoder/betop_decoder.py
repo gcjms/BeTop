@@ -46,6 +46,9 @@ class BeTopDecoder(nn.Module):
         self.use_longitudinal_topo = self.model_cfg.get('USE_LONGITUDINAL_TOPO', False)
         self.longitudinal_s_threshold = self.model_cfg.get('LONGITUDINAL_S_THRESHOLD', 5.0)
         self.longitudinal_l_threshold = self.model_cfg.get('LONGITUDINAL_L_THRESHOLD', 2.0)
+        
+        # 三分类拓扑配置：1=二分类(有/无冲突)，3=三分类(让/无关/超)
+        self.topo_num_classes = self.model_cfg.get('TOPO_NUM_CLASSES', 1)
 
         self.num_topo = self.model_cfg.get('NUM_TOPO', 0)
 
@@ -178,10 +181,13 @@ class BeTopDecoder(nn.Module):
             [TopoFuser(d_map_model, d_map_model//2, dropout) for _ in range(num_decoder_layers)]
             )
         
+        # Actor 拓扑解码器：支持三分类
         self.actor_topo_decoders = nn.ModuleList(
-            [TopoDecoder(actor_d_model//2, dropout, self.multi_step) for _ in range(num_decoder_layers)]
+            [TopoDecoder(actor_d_model//2, dropout, self.multi_step, 
+                        num_classes=self.topo_num_classes) for _ in range(num_decoder_layers)]
             )
         
+        # Map 拓扑解码器：保持二分类（地图拓扑不需要超让方向）
         self.map_topo_decoders = nn.ModuleList(
             [TopoDecoder(d_map_model//2, dropout, self.multi_step) for _ in range(num_decoder_layers)]
             )
@@ -844,12 +850,16 @@ class BeTopDecoder(nn.Module):
                 agent_mask=tgt_trajs_mask,
                 multi_step=multi_step
             )
-            # 路口拓扑返回 {-1, 0, +1}，需要转换为二分类（有冲突/无冲突）用于 loss
-            # 保留原始值用于后续分析
-            actor_topo_binary = (actor_topo != 0).float()  # 有冲突为1，无冲突为0
             # 保存完整的3类拓扑用于分析
             self.forward_ret_dict['actor_topo_full'] = actor_topo
-            actor_topo = actor_topo_binary
+            
+            if self.topo_num_classes == 3:
+                # 三分类模式：保留 {-1, 0, +1} 原始标签
+                # 保留完整的 multi_step 维度: [B, 1, N, multi_step]
+                actor_topo = actor_topo.float()
+            else:
+                # 二分类模式：转换为有/无冲突
+                actor_topo = (actor_topo != 0).float()  # 有冲突为1，无冲突为0
         else:
             # 使用原始的 2D 轨迹交叉检测
             # actor_topo 就是bool值 针对每个map和obs
@@ -883,23 +893,37 @@ class BeTopDecoder(nn.Module):
         监督模型学习预测正确的拓扑关系（如"自车会从左边超过障碍物A"）
         
         【输入】
-        - actor_topo: [B, 1, N_agents, T] Ground Truth 拓扑标签（Braid 编码）
-          - 编码了自车与其他障碍物的交互模式（如轨迹交叉顺序）
+        - actor_topo: 
+          - 二分类: [B, 1, N_agents, multi_step] Ground Truth 拓扑标签（Braid 编码）
+          - 三分类: [B, 1, N_agents, multi_step] 值域 {-1, 0, +1}
         - actor_topo_mask: [B, 1, N_agents] 有效障碍物掩码
-        - actor_topo_pred: [B, 1, N_agents, 1] 模型预测的拓扑分数
-        - map_topo / map_topo_pred: 地图车道线的拓扑关系（类似）
-        
-        【实现细节】
-        - top_k=True, top_k_ratio=0.25: 只计算 Top 25% 难例的 Loss（Hard Example Mining）
-        - 这样做可以让模型更关注预测错误的样本，提高学习效率
+        - actor_topo_pred: 
+          - 二分类: [B, 1, N_agents, multi_step] 模型预测的 logits
+          - 三分类: [B, 1, N_agents, multi_step, 3] 模型预测的 3 个类别 logits
+        - map_topo / map_topo_pred: 地图车道线的拓扑关系（类似，始终为二分类）
         
         【返回】
         - actor_topo_loss: 障碍物拓扑损失
         - map_topo_loss: 地图拓扑损失
         ============================================================================
         """
-        actor_topo_loss = loss_utils.topo_loss(actor_topo_pred, actor_topo.detach(), 
-            actor_topo_mask.float().detach(), top_k=True, top_k_ratio=0.25)
+        from betopnet.utils.topo_metrics import topo_loss_3class
+        
+        if self.topo_num_classes == 3:
+            # 三分类损失: Focal Loss (CrossEntropy 变体)
+            # actor_topo_pred: [B, 1, N, multi_step, 3]
+            # actor_topo: [B, 1, N, multi_step], 值域 {-1, 0, +1}
+            actor_topo_loss = topo_loss_3class(
+                pred=actor_topo_pred, 
+                gt=actor_topo.detach(),
+                mask=actor_topo_mask.detach()
+            )
+        else:
+            # 二分类损失: Focal Loss (原有逻辑)
+            actor_topo_loss = loss_utils.topo_loss(actor_topo_pred, actor_topo.detach(), 
+                actor_topo_mask.float().detach(), top_k=True, top_k_ratio=0.25)
+        
+        # Map 拓扑始终使用二分类
         map_topo_loss = loss_utils.topo_loss(map_topo_pred, map_topo[..., None].detach(), 
             map_topo_mask.float().detach(), top_k=True, top_k_ratio=0.25)
 
@@ -1015,6 +1039,17 @@ class BeTopDecoder(nn.Module):
                 )
                 tb_dict.update(layer_tb_dict_ade)
                 disp_dict.update(layer_tb_dict_ade)
+                
+                # 计算拓扑准确率指标
+                from betopnet.utils.topo_metrics import compute_topo_metrics
+                topo_metrics_dict = compute_topo_metrics(
+                    pred=actor_topo_preds, 
+                    gt=actor_topo, 
+                    mask=actor_topo_mask,
+                    num_classes=self.topo_num_classes
+                )
+                for k, v in topo_metrics_dict.items():
+                    tb_dict[f'{tb_pre_tag}{k}'] = v
 
         total_loss = total_loss / self.num_decoder_layers
 

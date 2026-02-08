@@ -16,13 +16,37 @@ def agent_topo_indexing(
     obj_mask, 
     max_agents=192
     ):
+    """
+    根据拓扑预测分数选择 TopK 个最相关的障碍物
+    
+    Args:
+        agent_topo_pred: 
+            - 二分类: [B, M, N, multi_step] 预测 logits
+            - 三分类: [B, M, N, multi_step, 3] 预测 logits (让/无关/超)
+        obj_mask: [B, N] 障碍物有效性掩码
+        max_agents: 最大选择数量
+    
+    Returns:
+        top_indice: [B, M, max_agents] 选中的障碍物索引
+    """
     num_actors = obj_mask.shape[1]
-    agent_topo_pred = agent_topo_pred.detach().sigmoid()
+    
+    # 计算冲突概率
+    if len(agent_topo_pred.shape) == 5:
+        # 三分类: [B, M, N, T, 3]
+        # 有冲突概率 = P(让) + P(超) = 1 - P(无关)
+        # 类别顺序: {0: 让, 1: 无关, 2: 超}（从 {-1, 0, +1} 映射而来）
+        probs = torch.softmax(agent_topo_pred.detach(), dim=-1)
+        conflict_prob = probs[..., 0] + probs[..., 2]  # [B, M, N, T]
+        # 取所有时间步中的最大冲突概率
+        conflict_prob = conflict_prob.max(dim=-1)[0]  # [B, M, N]
+    else:
+        # 二分类: [B, M, N, T] logits
+        # 直接使用 sigmoid 并取最大值
+        conflict_prob = agent_topo_pred.detach().sigmoid().max(dim=-1)[0]  # [B, M, N]
 
-    agent_topo_pred = agent_topo_pred[..., 0]
-
-    agent_topo_pred = agent_topo_pred * obj_mask.float()[:, None, :]
-    top_dist, top_indice = torch.topk(agent_topo_pred, 
+    conflict_prob = conflict_prob * obj_mask.float()[:, None, :]
+    top_dist, top_indice = torch.topk(conflict_prob, 
                         k=min(max_agents, num_actors), dim=-1)
     top_indice[top_dist==0] = -1
 
