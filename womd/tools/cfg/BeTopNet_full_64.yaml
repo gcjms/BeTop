@@ -97,9 +97,10 @@ MODEL:
         NUM_TOPO: 32
 
         # 纵向拓扑配置（路口超让检测）
-        USE_LONGITUDINAL_TOPO: False  # 改为 True 启用纵向拓扑
-        LONGITUDINAL_S_THRESHOLD: 20.0  # 冲突区大小（米），需足够大以覆盖让行距离
-        LONGITUDINAL_L_THRESHOLD: 3.0  # 判断是否在同一路径（米）
+        USE_LONGITUDINAL_TOPO: True  # 启用纵向拓扑（路口冲突检测）
+        TOPO_NUM_CLASSES: 3          # 三分类：让(-1)/无关(0)/超(+1)
+        LONGITUDINAL_S_THRESHOLD: 20.0  # 冲突区大小（米）
+        LONGITUDINAL_L_THRESHOLD: 3.0   # 判断是否在同一路径（米）
 
 
 OPTIMIZATION:
